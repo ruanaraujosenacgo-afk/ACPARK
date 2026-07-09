@@ -1,0 +1,18 @@
+{
+  "name": "myestoque-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server/index.js",
+    "seed": "node server/seed.js",
+    "build": "node -e \"console.log('No build required')\""
+  },
+  "dependencies": {
+    "bcryptjs": "2.4.3",
+    "cookie": "0.6.0",
+    "dotenv": "16.4.7",
+    "jsonwebtoken": "9.0.2",
+    "pg": "8.13.1"
+  }
+}
