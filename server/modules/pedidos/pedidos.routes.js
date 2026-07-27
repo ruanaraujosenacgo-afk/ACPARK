@@ -1,5 +1,6 @@
 ﻿import { query, tx, asInt, code } from "../../db.js";
 import { normalizeText, readBody, send } from "../../utils/http.js";
+import { publishOrderAlert } from "../../services/order-alerts/order-alerts.events.js";
 import { normalizeOrderStatus, orderStatuses } from "./pedidos.service.js";
 
 let pedidoEditColumnsReady = null;
@@ -296,8 +297,24 @@ export async function handlePedidosRoutes(req, res, context) {
         [idempotencyKey, orderCode, user.pdvId]
       );
       await client.query("DELETE FROM pedido_rascunhos WHERE pdv_id = $1", [user.pdvId]);
-      return { codigo: orderCode, repeated: false };
+      const pdvRows = await client.query("SELECT nome FROM pdvs WHERE id = $1", [user.pdvId]);
+      return {
+        codigo: orderCode,
+        repeated: false,
+        alert: {
+          orderId: orderCode,
+          orderNumber: orderCode,
+          pointId: user.pdvId,
+          pointName: pdvRows.rows[0]?.nome || user.name || "PDV",
+          itemCount: items.length,
+          createdAt: new Date().toISOString(),
+          origin: "PDV"
+        }
+      };
     });
+    if (!result.repeated && result.alert) {
+      publishOrderAlert("NEW_PENDING_ORDER", result.alert);
+    }
     send(res, result.repeated ? 200 : 201, { ok: true, codigo: result.codigo, repeated: result.repeated });
     return true;
   }

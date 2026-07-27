@@ -6,6 +6,13 @@ import { startAutoRefresh, stopAutoRefresh } from "./js/ui/auto-refresh.js";
 import { toast } from "./js/ui/notifications.js";
 import { moneyDate, monthLabel, monthsAgo, pendingReleaseQty, today, weekAgo } from "./js/utils/formatters.js";
 import { parseProductsFile, spreadsheetText } from "./js/utils/spreadsheets.js";
+import {
+  activateOrderAlertAudio,
+  bindOrderAlertSettings,
+  renderOrderAlertSettings,
+  startOrderAlerts,
+  stopOrderAlerts
+} from "./js/services/order-alerts.js";
 
 let damageDraftItems = [];
 let renderDamageDraftItems;
@@ -75,7 +82,7 @@ function shell(content, actions = "") {
           <strong>${esc(displayName)}</strong>
         </div>
         <div class="side-menu-list">
-          ${items.map(([id, label]) => `<button class="side-link nav-btn" data-view="${id}">${label}</button>`).join("")}
+          ${items.map(([id, label]) => `<button class="side-link nav-btn" data-view="${id}">${label}${id === "release" ? ` <span class="nav-count ${state.orderAlertPendingCount ? "" : "hidden"}" data-global-release-count>${state.orderAlertPendingCount || 0}</span>` : ""}</button>`).join("")}
         </div>
         <button class="btn danger side-logout" id="logout">Sair</button>
       </aside>
@@ -94,7 +101,7 @@ function shell(content, actions = "") {
             <p class="eyebrow">Conectado como</p>
             <h2 class="section-title text-2xl font-black">${esc(displayName)}</h2>
           </div>
-          <div class="page-actions no-print">${actions}</div>
+          <div class="page-actions no-print"><button class="btn secondary hidden" id="order-alert-activate" type="button">Ativar alertas sonoros</button>${actions}</div>
         </div>
         ${content}
       </main>
@@ -135,10 +142,12 @@ function shell(content, actions = "") {
   }));
   document.querySelector("#logout").addEventListener("click", async () => {
     stopAutoRefresh();
+    stopOrderAlerts();
     await request("/api/auth/logout", { method: "POST" });
     state.user = null;
     renderLogin();
   });
+  document.querySelector("#order-alert-activate")?.addEventListener("click", activateOrderAlertAudio);
 }
 
 async function loadBootstrap() {
@@ -309,7 +318,35 @@ async function route(view) {
       auto: () => viewHistory(true),
       config: viewConfigV2
     };
+    if (state.user?.role === "admin") {
+      await startOrderAlerts({
+        route,
+        refreshRelease: async () => {
+          const from = document.querySelector("#release-from")?.value || weekAgo();
+          const to = document.querySelector("#release-to")?.value || today();
+          const pdvId = document.querySelector("#release-pdv-filter")?.value || "";
+          const q = document.querySelector("#release-code-filter")?.value || "";
+          const status = document.querySelector(".release-tabs .config-tab.is-active")?.dataset.releaseStatus || "Pendente";
+          await viewRelease({ from, to, pdvId, q, status, auto: true });
+        }
+      });
+    }
     await views[view]();
+    if (state.user?.role === "admin") {
+      await startOrderAlerts({
+        route,
+        refreshRelease: async () => {
+          const from = document.querySelector("#release-from")?.value || weekAgo();
+          const to = document.querySelector("#release-to")?.value || today();
+          const pdvId = document.querySelector("#release-pdv-filter")?.value || "";
+          const q = document.querySelector("#release-code-filter")?.value || "";
+          const status = document.querySelector(".release-tabs .config-tab.is-active")?.dataset.releaseStatus || "Pendente";
+          await viewRelease({ from, to, pdvId, q, status, auto: true });
+        }
+      });
+    } else {
+      stopOrderAlerts();
+    }
   } catch (error) {
     console.error(`Erro ao carregar a tela ${view}:`, error);
     const friendlyMessage = view === "release"
@@ -5397,6 +5434,11 @@ async function viewRelease(filters = {}) {
   let selectedPdvId = filters.pdvId || document.querySelector("#release-pdv-filter")?.value || "";
   let searchCode = filters.q || document.querySelector("#release-code-filter")?.value || "";
   let activeStatus = filters.status || document.querySelector(".release-tabs .config-tab.is-active")?.dataset.releaseStatus || "Pendente";
+  const focusOrderCode = !filters.auto ? (filters.focusOrder || sessionStorage.getItem("acparkFocusReleaseOrder") || "") : "";
+  if (focusOrderCode) {
+    activeStatus = "Pendente";
+  }
+  const focusRetry = Boolean(filters.focusRetry);
   if (from && to && from > to) {
     toast("A data inicial não pode ser posterior à data final.", "error");
     [from, to] = [to, from];
@@ -5514,6 +5556,7 @@ async function viewRelease(filters = {}) {
     await viewRelease({ from, to, pdvId: selectedPdvId, q: searchCode, status: activeStatus });
   });
   bindReleaseInteractions(from, to, activeStatus, document, selectedPdvId, searchCode);
+  focusReleaseOrderFromAlert(focusOrderCode, { focusRetry });
   startAutoRefresh("release", async () => {
     if (document.body.classList.contains("printing-receipt")) return;
     const currentStatus = document.querySelector(".release-tabs .config-tab.is-active")?.dataset.releaseStatus || activeStatus;
@@ -5521,6 +5564,48 @@ async function viewRelease(filters = {}) {
     const currentSearchCode = document.querySelector("#release-code-filter")?.value || searchCode;
     await viewRelease({ from, to, pdvId: currentPdvId, q: currentSearchCode, status: currentStatus, auto: true });
   }, 5000, { ignoreEditing: true });
+}
+
+async function focusReleaseOrderFromAlert(orderCode, context = {}) {
+  if (!orderCode) return;
+  const card = document.querySelector(`[data-order="${CSS.escape(String(orderCode))}"]`);
+  if (!card) {
+    if (context.focusRetry) {
+      sessionStorage.removeItem("acparkFocusReleaseOrder");
+      toast("Não foi possível localizar o pedido na lista de pendentes.", "error");
+      return;
+    }
+    const showAllPending = await confirmSystem({
+      title: "Pedido fora dos filtros",
+      message: "Este pedido está fora dos filtros atuais.",
+      consequence: "Você pode visualizar todos os pedidos pendentes sem aplicar o código do pedido como filtro.",
+      confirmLabel: "Visualizar todos os pendentes",
+      cancelLabel: "Manter filtros"
+    });
+    if (!showAllPending) {
+      sessionStorage.removeItem("acparkFocusReleaseOrder");
+      return;
+    }
+    await viewRelease({
+      from: weekAgo(),
+      to: today(),
+      pdvId: "",
+      q: "",
+      status: "Pendente",
+      focusOrder: orderCode,
+      focusRetry: true
+    });
+    return;
+  }
+  sessionStorage.removeItem("acparkFocusReleaseOrder");
+  const head = card.querySelector("[data-toggle-order]");
+  const body = card.querySelector(".order-accordion-body");
+  card.classList.add("order-alert-focus");
+  card.classList.add("is-open");
+  head?.setAttribute("aria-expanded", "true");
+  body?.classList.remove("hidden");
+  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  setTimeout(() => card.classList.remove("order-alert-focus"), 4500);
 }
 
 function bindReleaseInteractions(from, to, activeStatus, root = document, pdvId = "", q = "") {
@@ -7027,6 +7112,7 @@ async function viewConfigV2() {
         <button class="config-tab" type="button" data-config-tab="pdv" role="tab" aria-selected="false">Criar PDV</button>
         <button class="config-tab" type="button" data-config-tab="security" role="tab" aria-selected="false">Segurança</button>
         <button class="config-tab" type="button" data-config-tab="apis" role="tab" aria-selected="false">APIs</button>
+        <button class="config-tab" type="button" data-config-tab="alerts" role="tab" aria-selected="false">Alertas</button>
       </div>
 
       <div class="config-tab-panels">
@@ -7095,6 +7181,10 @@ async function viewConfigV2() {
             <button class="btn" id="open-integrations-center" type="button">Abrir central de integrações</button>
           </form>
         </section>
+
+        <section class="config-panel hidden" data-config-panel="alerts" role="tabpanel">
+          ${renderOrderAlertSettings()}
+        </section>
       </div>
     </section>`);
 
@@ -7112,6 +7202,7 @@ async function viewConfigV2() {
   };
   document.querySelectorAll("[data-config-tab]").forEach((button) => button.addEventListener("click", () => setConfigTab(button.dataset.configTab)));
   document.querySelector("#open-integrations-center")?.addEventListener("click", () => route("omie"));
+  bindOrderAlertSettings();
 
   const categoryPickers = {};
   const setupCategoryPicker = (id, initial = []) => {

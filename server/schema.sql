@@ -762,3 +762,53 @@ CREATE INDEX IF NOT EXISTS idx_devolucao_idempotencia_devolucao ON devolucao_ide
 CREATE INDEX IF NOT EXISTS idx_omie_jobs_status ON omie_jobs(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_omie_jobs_entity ON omie_jobs(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_omie_jobs_product ON omie_jobs(product_sku);
+
+CREATE TABLE IF NOT EXISTS user_order_alert_preferences (
+  id BIGSERIAL PRIMARY KEY,
+  user_key TEXT NOT NULL UNIQUE,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  sound_id VARCHAR(100) NOT NULL DEFAULT 'repetitive-alert',
+  volume INTEGER NOT NULL DEFAULT 70,
+  visual_notifications BOOLEAN NOT NULL DEFAULT TRUE,
+  repeat_mode VARCHAR(40) NOT NULL DEFAULT 'three_times',
+  repeat_interval_seconds INTEGER NOT NULL DEFAULT 5,
+  stop_on_view BOOLEAN NOT NULL DEFAULT TRUE,
+  stop_on_service_start BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE user_order_alert_preferences ADD COLUMN IF NOT EXISTS repeat_mode VARCHAR(40) NOT NULL DEFAULT 'three_times';
+ALTER TABLE user_order_alert_preferences ADD COLUMN IF NOT EXISTS repeat_interval_seconds INTEGER NOT NULL DEFAULT 5;
+ALTER TABLE user_order_alert_preferences ADD COLUMN IF NOT EXISTS stop_on_view BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE user_order_alert_preferences ADD COLUMN IF NOT EXISTS stop_on_service_start BOOLEAN NOT NULL DEFAULT TRUE;
+
+CREATE TABLE IF NOT EXISTS order_alert_sounds (
+  id BIGSERIAL PRIMARY KEY,
+  sound_key VARCHAR(100) NOT NULL UNIQUE,
+  display_name VARCHAR(150) NOT NULL,
+  storage_path VARCHAR(500),
+  mime_type VARCHAR(100),
+  size_bytes BIGINT DEFAULT 0,
+  duration_seconds NUMERIC,
+  is_system BOOLEAN NOT NULL DEFAULT FALSE,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_by TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO order_alert_sounds (sound_key, display_name, is_system, is_active)
+VALUES
+  ('default', 'Alerta padrão', TRUE, TRUE),
+  ('bell', 'Campainha curta', TRUE, TRUE),
+  ('soft', 'Toque suave', TRUE, TRUE),
+  ('chime', 'Chime', TRUE, TRUE),
+  ('double', 'Toque duplo', TRUE, TRUE),
+  ('repetitive-alert', 'Alerta repetitivo', TRUE, TRUE),
+  ('repetitive-bell', 'Campainha repetitiva', TRUE, TRUE),
+  ('urgent', 'Chamada urgente', TRUE, TRUE),
+  ('waiting', 'Pedido aguardando', TRUE, TRUE),
+  ('soft-continuous', 'Alerta contínuo suave', TRUE, TRUE)
+ON CONFLICT (sound_key) DO UPDATE
+SET display_name = EXCLUDED.display_name,
+    is_system = TRUE,
+    is_active = TRUE;

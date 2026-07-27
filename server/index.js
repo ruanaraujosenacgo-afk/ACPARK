@@ -11,6 +11,7 @@ import { syncPdvAllowedProducts } from "./modules/estoque/estoque.service.js";
 import { handlePedidosRoutes } from "./modules/pedidos/pedidos.routes.js";
 import { handleAvariasRoutes } from "./modules/avarias/avarias.routes.js";
 import { handleOmieRoutes } from "./modules/omie/omie.routes.js";
+import { handleOrderAlertRoutes } from "./modules/order-alerts/order-alerts.routes.js";
 import { handleIntegrationWebhookRoutes, handleIntegrationsRoutes } from "./modules/integrations/integrations.routes.js";
 import { runOmieSchedulerTick, startOmieScheduler } from "./services/integrations/omie/omie.scheduler.js";
 import { normalizeCategories, normalizeCategoryList, normalizeText, readBody, send } from "./utils/http.js";
@@ -147,6 +148,8 @@ async function api(req, res) {
   if (!user) return;
 
   await processAutoOrders();
+
+  if (await handleOrderAlertRoutes(req, res, { method, url, user })) return;
 
   if (url.pathname === "/api/bootstrap") {
     const [pdvs, products, categories, configRows] = await Promise.all([
