@@ -1,0 +1,25 @@
+{
+  "name": "myestoque-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "dev": "node server/index.js",
+    "seed": "node server/seed.js",
+    "build": "node -e \"console.log('No build required')\"",
+    "test": "node tests/server-routes.test.js && node tests/no-printing-integration.test.js && node tests/integrations-architecture.test.js && node tests/omie-read-sync.test.js && node tests/omie-auto-sync.test.js && node tests/omie-service.test.js && node tests/omie-routes.test.js && node tests/order-draft.test.js && node tests/order-print-layout.test.js && node tests/almox-add-product.test.js && node tests/pdv-category-picker.test.js && node tests/release-bulk-delete.test.js && node tests/avarias-idempotency.test.js && node tests/avarias-manual-flow.test.js && node tests/storage-service.test.js",
+    "production:check": "node tools/check-production-readiness.js",
+    "storage:check": "node tools/check-storage-config.js --require-durable",
+    "migrate:avaria-photos": "node tools/migrate-avaria-photos.js"
+  },
+  "dependencies": {
+    "bcryptjs": "2.4.3",
+    "cookie": "0.6.0",
+    "dotenv": "16.4.7",
+    "jsonwebtoken": "9.0.2",
+    "pg": "8.13.1"
+  }
+}
