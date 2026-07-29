@@ -1,34 +1,32 @@
 import crypto from "node:crypto";
 
-const ALGORITHM = "aes-256-gcm";
+const ENCRYPTION_PREFIX = "enc:v1";
 
-function secretMaterial(env = process.env) {
-  return env.INTEGRATION_ENCRYPTION_KEY || env.JWT_SECRET || "dev-only-change-me";
-}
-
-function keyFromEnv(env = process.env) {
-  return crypto.createHash("sha256").update(String(secretMaterial(env))).digest();
+function getSecretKey(env = process.env) {
+  const raw = env.INTEGRATION_ENCRYPTION_KEY || env.JWT_SECRET;
+  if (env.NODE_ENV === "production" && (!raw || raw === "dev-only-change-me")) {
+    throw new Error("INTEGRATION_ENCRYPTION_KEY obrigatorio em producao.");
+  }
+  return crypto.createHash("sha256").update(String(raw || "local-integration-secret")).digest();
 }
 
 export function encryptSecret(value, env = process.env) {
-  const plain = String(value || "");
-  if (!plain) return "";
+  if (value === null || value === undefined || value === "") return "";
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv(ALGORITHM, keyFromEnv(env), iv);
-  const encrypted = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  const cipher = crypto.createCipheriv("aes-256-gcm", getSecretKey(env), iv);
+  const encrypted = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return `v1:${iv.toString("base64")}:${tag.toString("base64")}:${encrypted.toString("base64")}`;
+  return [ENCRYPTION_PREFIX, iv.toString("base64url"), tag.toString("base64url"), encrypted.toString("base64url")].join(":");
 }
 
 export function decryptSecret(value, env = process.env) {
-  const stored = String(value || "");
-  if (!stored) return "";
-  const [version, iv, tag, encrypted] = stored.split(":");
-  if (version !== "v1" || !iv || !tag || !encrypted) return "";
-  const decipher = crypto.createDecipheriv(ALGORITHM, keyFromEnv(env), Buffer.from(iv, "base64"));
-  decipher.setAuthTag(Buffer.from(tag, "base64"));
+  if (!value || typeof value !== "string") return "";
+  if (!value.startsWith(`${ENCRYPTION_PREFIX}:`)) return value;
+  const [, , ivRaw, tagRaw, encryptedRaw] = value.split(":");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", getSecretKey(env), Buffer.from(ivRaw, "base64url"));
+  decipher.setAuthTag(Buffer.from(tagRaw, "base64url"));
   return Buffer.concat([
-    decipher.update(Buffer.from(encrypted, "base64")),
+    decipher.update(Buffer.from(encryptedRaw, "base64url")),
     decipher.final()
   ]).toString("utf8");
 }
@@ -40,30 +38,23 @@ export function maskSecret(value) {
   return `${text.slice(0, 3)}***${text.slice(-3)}`;
 }
 
-export function sanitizeIntegration(row = {}, credentials = []) {
+export function sanitizeIntegration(integration = {}, credentials = []) {
   return {
-    id: row.id,
-    nome: row.nome,
-    provedor: row.provedor,
-    tipo: row.tipo,
-    ambiente: row.ambiente,
-    url_base: row.url_base,
-    empresa_vinculada: row.empresa_vinculada,
-    ativo: row.ativo,
-    status: row.status,
-    ultima_sincronizacao: row.ultima_sincronizacao,
-    last_error: row.last_error,
-    last_connection_test_at: row.last_connection_test_at,
-    last_connection_duration_ms: row.last_connection_duration_ms,
-    last_connection_message: row.last_connection_message,
-    stock_mode: row.stock_mode || "MANUAL",
-    sync_intervals: row.sync_intervals || {},
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    credentials: credentials.map((item) => ({
-      key: item.credential_key,
-      masked_value: item.masked_value || "",
-      configured: Boolean(item.masked_value)
+    id: integration.id,
+    nome: integration.nome,
+    provedor: integration.provedor,
+    tipo: integration.tipo,
+    ambiente: integration.ambiente,
+    ativo: integration.ativo,
+    status: integration.status,
+    url_base: integration.url_base,
+    stock_mode: integration.stock_mode,
+    created_at: integration.created_at,
+    updated_at: integration.updated_at,
+    credentials: credentials.map((credential) => ({
+      key: credential.credential_key || credential.key,
+      masked_value: credential.masked_value || maskSecret(credential.value),
+      configured: Boolean(credential.encrypted_value || credential.masked_value || credential.value)
     }))
   };
 }

@@ -20,7 +20,7 @@ export async function callOmie(endpoint, payload, { fetchImpl = fetch, env = pro
       signal: controller.signal
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
+    if (!response.ok || data?.faultstring || data?.faultcode) {
       throw new OmieRequestError(data.faultstring || data.message || "Falha na comunicação com o OMIE.", {
         status: response.status,
         retryable: isRetryableOmieStatus(response.status),

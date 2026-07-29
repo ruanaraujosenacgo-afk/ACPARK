@@ -120,15 +120,16 @@ function mapPreferenceRow(row) {
 async function pendingOrdersSummary() {
   const rows = await query(
     `SELECT
-       COALESCE(NULLIF(codigo_pedido, ''), id::text) AS "orderNumber",
-       COALESCE(NULLIF(codigo_pedido, ''), id::text) AS "orderId",
-       COALESCE(MAX(pdv), 'PDV') AS "pointName",
-       MIN(criado_em) AS "createdAt",
+       COALESCE(NULLIF(p.codigo_pedido, ''), p.id::text) AS "orderNumber",
+       COALESCE(NULLIF(p.codigo_pedido, ''), p.id::text) AS "orderId",
+       COALESCE(MAX(pd.nome), 'PDV') AS "pointName",
+       MIN(COALESCE(p.criado_em, p.data_hora)) AS "createdAt",
        COUNT(*)::int AS "itemCount"
-     FROM pedidos
-     WHERE status = 'Pendente'
-     GROUP BY COALESCE(NULLIF(codigo_pedido, ''), id::text)
-     ORDER BY MIN(criado_em) DESC
+     FROM pedidos p
+     LEFT JOIN pdvs pd ON pd.id = p.pdv_id
+     WHERE p.status = 'Pendente'
+     GROUP BY COALESCE(NULLIF(p.codigo_pedido, ''), p.id::text)
+     ORDER BY MIN(COALESCE(p.criado_em, p.data_hora)) DESC
      LIMIT 30`
   );
   return rows;
@@ -149,7 +150,7 @@ async function pendingOrderIds() {
      FROM pedidos
      WHERE status = 'Pendente'
      GROUP BY COALESCE(NULLIF(codigo_pedido, ''), id::text)
-     ORDER BY MIN(criado_em) DESC`
+     ORDER BY MIN(COALESCE(criado_em, data_hora)) DESC`
   );
   return rows.map((row) => String(row.orderId)).filter(Boolean);
 }

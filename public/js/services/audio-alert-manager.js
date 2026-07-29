@@ -35,6 +35,7 @@ const alertState = {
   isPlaying: false,
   audioContext: null,
   cancelled: false,
+  activeNodes: new Set(),
   audioUnlocked: localStorage.getItem(activationKey) === "true",
   blockedToastShown: false
 };
@@ -63,6 +64,32 @@ function ensureAudioContext() {
   if (!AudioCtx) return null;
   alertState.audioContext ||= new AudioCtx();
   return alertState.audioContext;
+}
+
+function trackAudioNode(node) {
+  alertState.activeNodes.add(node);
+  node.addEventListener("ended", () => {
+    alertState.activeNodes.delete(node);
+    try {
+      node.disconnect();
+    } catch {
+      // O nó pode já ter sido desconectado ao cancelar o alerta.
+    }
+  }, { once: true });
+}
+
+function stopActiveAudioNodes() {
+  for (const node of alertState.activeNodes) {
+    try {
+      node.stop(0);
+    } catch {
+      // Alguns navegadores lançam erro quando o nó já foi encerrado.
+    }
+    try {
+      node.disconnect();
+    } catch {}
+  }
+  alertState.activeNodes.clear();
 }
 
 export function audioIsActivated() {
@@ -131,10 +158,12 @@ async function playTone(soundId, volume) {
   const profile = soundProfiles[soundId] || soundProfiles.default;
   let start = ctx.currentTime;
   for (const note of profile) {
+    if (alertState.cancelled) break;
     const duration = Math.max(0.05, Number(note.duration || 0.12));
     if (Number(note.frequency) > 0) {
       const oscillator = ctx.createOscillator();
       const gain = ctx.createGain();
+      trackAudioNode(oscillator);
       oscillator.type = soundId === "urgent" ? "triangle" : "sine";
       oscillator.frequency.setValueAtTime(Number(note.frequency), start);
       gain.gain.setValueAtTime(0.0001, start);
@@ -265,6 +294,7 @@ export function stopCurrentOrderAlert(orderId = null) {
     alertState.activeOrderIds.delete(orderId);
     if (alertState.current?.orderId && alertState.current.orderId !== orderId) return;
     alertState.cancelled = true;
+    stopActiveAudioNodes();
     clearAlertTimer();
     if (!alertState.current) {
       alertState.isPlaying = false;
@@ -272,6 +302,7 @@ export function stopCurrentOrderAlert(orderId = null) {
     }
   } else {
     alertState.cancelled = true;
+    stopActiveAudioNodes();
     clearAlertTimer();
     alertState.queue = [];
     alertState.activeOrderIds.clear();

@@ -22,6 +22,55 @@ export function buildDamageOperationKey({ devolucaoId, itemId, sku, movementType
   return `AVARIA-${devolucaoId}-ITEM-${itemId || sku}-${movementType}-V${version}`;
 }
 
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+export function formatOmieDate(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return formatOmieDate(new Date());
+  return `${pad2(date.getDate())}/${pad2(date.getMonth() + 1)}/${date.getFullYear()}`;
+}
+
+export function normalizeOmieQuantity(value) {
+  const quantity = Number(String(value || 0).replace(",", "."));
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw new Error("Quantidade inválida para integração OMIE.");
+  }
+  return String(quantity).replace(".", ",");
+}
+
+export function buildOmieStockAdjustmentPayload({
+  operationKey,
+  productExternalId,
+  productSku,
+  locationCode,
+  quantity,
+  date = new Date(),
+  note,
+  movementType = "SAI",
+  origin = "AJU",
+  reason = "PER",
+  value = 0,
+  lotes = []
+}) {
+  const payload = {
+    cod_int_ajuste: String(operationKey || "").slice(0, 60),
+    data: formatOmieDate(date),
+    quan: normalizeOmieQuantity(quantity),
+    obs: String(note || "Baixa registrada pelo ACPARK.").slice(0, 500),
+    origem: origin,
+    tipo: movementType,
+    motivo: reason,
+    valor: Number.isFinite(Number(value)) ? Number(value) : 0
+  };
+  if (locationCode) payload.codigo_local_estoque = Number(locationCode);
+  if (productExternalId) payload.id_prod = Number(productExternalId);
+  else if (productSku) payload.cod_int = String(productSku).slice(0, 20);
+  if (Array.isArray(lotes) && lotes.length) payload.lote_validade = lotes;
+  return payload;
+}
+
 export async function createOmieJob(client, {
   operationKey,
   entityType,
@@ -88,11 +137,11 @@ export async function processNextOmieJob(client, { fetchImpl = fetch, env = proc
 
   try {
     const payload = typeof job.payload === "string" ? JSON.parse(job.payload) : job.payload;
-    const response = await callOmie("/estoque/movimentacoes/", {
-      call: "IncluirMovimentoEstoque",
+    const response = await callOmie("/estoque/ajuste/", {
+      call: "IncluirAjusteEstoque",
       param: [payload]
     }, { fetchImpl, env });
-    const externalId = response.data?.codigo_movimento || response.data?.nCodMovEstoque || response.data?.id || job.operation_key;
+    const externalId = response.data?.id_ajuste || response.data?.id_movest || response.data?.codigo_movimento || response.data?.nCodMovEstoque || response.data?.id || job.operation_key;
     await client.query(
       `UPDATE omie_jobs
        SET status = 'SUCCESS',

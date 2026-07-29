@@ -47,7 +47,6 @@ function ensurePedidoEditColumns() {
     await client.query("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS pedido_reaberto_finalizado BOOLEAN DEFAULT FALSE");
     await client.query("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS release_mode TEXT");
     await client.query("ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS item_origem TEXT DEFAULT 'PDV'");
-    await client.query("UPDATE pedidos SET item_origem = 'PDV' WHERE item_origem IS NULL OR trim(item_origem) = ''");
   });
   return pedidoEditColumnsReady;
 }
@@ -55,113 +54,12 @@ function ensurePedidoEditColumns() {
 async function ensurePartialReleaseRemainders() {
   await ensurePedidoEditColumns();
   await tx(async (client) => {
-    const duplicateRemainders = await client.query(
-      `SELECT id, codigo_pedido, sku_produto, quantidade_solicitada
-       FROM pedidos
-       WHERE status IN ('Liberação Parcial', 'Liberado Parcial')
-         AND COALESCE(quantidade_liberada, 0) <= 0
-       ORDER BY codigo_pedido, sku_produto, id
-       FOR UPDATE`
+    await client.query(
+      `UPDATE pedidos
+       SET status = 'Aguardando Retirada',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE status IN ('Liberação Parcial', 'Liberado Parcial')`
     );
-    const remainderGroups = new Map();
-    for (const row of duplicateRemainders.rows) {
-      const key = `${row.codigo_pedido}::${row.sku_produto}`;
-      const group = remainderGroups.get(key) || { keepId: row.id, keepQty: 0, ids: [] };
-      group.keepId = Math.min(group.keepId, row.id);
-      group.keepQty = Math.max(group.keepQty, asInt(row.quantidade_solicitada));
-      group.ids.push(row.id);
-      remainderGroups.set(key, group);
-    }
-    for (const group of remainderGroups.values()) {
-      if (group.ids.length <= 1) continue;
-      await client.query(
-        `UPDATE pedidos
-         SET quantidade_solicitada = $2,
-             pedido_editado = TRUE,
-             pedido_editado_em = CURRENT_TIMESTAMP,
-             pedido_editado_por = 'Correção automática',
-             version = COALESCE(version, 1) + 1,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
-        [group.keepId, group.keepQty]
-      );
-      const ids = group.ids.filter((id) => id !== group.keepId);
-      if (ids.length) {
-        await client.query("DELETE FROM pedidos WHERE id = ANY($1::int[])", [ids]);
-      }
-    }
-
-    const rows = await client.query(
-      `SELECT id, codigo_pedido, solicitante, pdv_id, sku_produto, quantidade_solicitada,
-              quantidade_liberada, observacao, release_mode
-       FROM pedidos
-       WHERE status = 'Aguardando Retirada'
-         AND COALESCE(release_mode, '') <> 'entered-only'
-         AND COALESCE(quantidade_liberada, 0) > 0
-         AND COALESCE(quantidade_liberada, 0) < quantidade_solicitada
-       ORDER BY id
-       FOR UPDATE`
-    );
-    for (const row of rows.rows) {
-      const releasedQty = asInt(row.quantidade_liberada);
-      const existingRemainder = await client.query(
-        `SELECT COALESCE(SUM(quantidade_solicitada), 0) AS total
-         FROM pedidos
-         WHERE codigo_pedido = $1
-           AND sku_produto = $2
-           AND status IN ('Liberação Parcial', 'Liberado Parcial')
-           AND COALESCE(quantidade_liberada, 0) <= 0
-           AND id <> $3`,
-        [row.codigo_pedido, row.sku_produto, row.id]
-      );
-      const existingMissingQty = asInt(existingRemainder.rows[0]?.total);
-      if (existingMissingQty > 0) {
-        const expectedRequestedQty = Math.max(asInt(row.quantidade_solicitada), releasedQty + existingMissingQty);
-        if (expectedRequestedQty !== asInt(row.quantidade_solicitada)) {
-          await client.query(
-            `UPDATE pedidos
-             SET quantidade_solicitada = $2,
-                 pedido_editado = TRUE,
-                 pedido_editado_em = CURRENT_TIMESTAMP,
-                 pedido_editado_por = 'Correção automática',
-                 version = COALESCE(version, 1) + 1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1`,
-            [row.id, expectedRequestedQty]
-          );
-        }
-        continue;
-      }
-      const missingQty = Math.max(asInt(row.quantidade_solicitada) - releasedQty, 0);
-      if (missingQty <= 0) continue;
-      await client.query(
-        `INSERT INTO pedidos
-           (codigo_pedido, solicitante, pdv_id, sku_produto, quantidade_solicitada, quantidade_liberada,
-            status, observacao, criado_em, data_hora, liberado_em, pronto_retirada_em,
-            pedido_editado, pedido_editado_em, pedido_editado_por, version, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 0, 'Liberação Parcial', $6,
-                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL, NULL,
-                 TRUE, CURRENT_TIMESTAMP, 'Correção automática', 1, CURRENT_TIMESTAMP)`,
-        [
-          row.codigo_pedido,
-          row.solicitante,
-          row.pdv_id,
-          row.sku_produto,
-          missingQty,
-          row.observacao
-        ]
-      );
-      await client.query(
-        `UPDATE pedidos
-         SET pedido_editado = TRUE,
-             pedido_editado_em = CURRENT_TIMESTAMP,
-             pedido_editado_por = 'Correção automática',
-             version = COALESCE(version, 1) + 1,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $1`,
-        [row.id]
-      );
-    }
   });
 }
 
@@ -279,9 +177,6 @@ export async function handlePedidosRoutes(req, res, context) {
           [user.pdvId, sku]
         );
         if (!allowed.rows[0]) throw new Error("Produto não liberado para este PDV.");
-        const max = asInt(allowed.rows[0].estoque_maximo);
-        const current = asInt(allowed.rows[0].quantidade);
-        if (max > 0 && current + qty > max) throw new Error(`Pedido acima do estoque maximo para ${sku}.`);
 
         await client.query(
           `INSERT INTO pedidos
@@ -325,22 +220,20 @@ export async function handlePedidosRoutes(req, res, context) {
     const from = url.searchParams.get("from");
     const to = url.searchParams.get("to");
     const rows = await query(
-      `SELECT p.id, p.codigo_pedido, p.data_hora, p.sku_produto, pr.nome AS produto, pr.qtd_total AS estoque_central, p.quantidade_solicitada,
+      `SELECT p.codigo_pedido, p.data_hora, pr.nome AS produto, pr.qtd_total AS estoque_central, p.quantidade_solicitada,
               p.quantidade_liberada,
+              COALESCE(p.item_origem, 'PDV') AS item_origem,
               CASE
                 WHEN p.status = 'Liberado' THEN 'Finalizado'
                 WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
-                WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 THEN 'Aguardando Retirada'
-                WHEN p.status = 'Liberado Parcial' THEN 'Liberação Parcial'
+                WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') THEN 'Aguardando Retirada'
                 ELSE p.status
               END AS status,
               p.observacao, p.em_andamento_em, p.liberado_em, p.pronto_retirada_em,
               p.retirada_assinatura, p.retirada_responsavel, p.retirada_observacao,
               p.retirada_em, p.retirada_usuario_almoxarifado,
-              p.version, p.updated_at,
               COALESCE(p.pedido_editado, FALSE) AS pedido_editado, p.pedido_editado_em, p.pedido_editado_por,
-              COALESCE(p.pedido_reaberto_finalizado, FALSE) AS pedido_reaberto_finalizado,
-              COALESCE(p.item_origem, 'PDV') AS item_origem
+              COALESCE(p.pedido_reaberto_finalizado, FALSE) AS pedido_reaberto_finalizado
        FROM pedidos p
        JOIN produtos pr ON pr.sku = p.sku_produto
        WHERE p.pdv_id = $1 AND ($2::date IS NULL OR p.data_hora::date >= $2::date)
@@ -358,8 +251,6 @@ export async function handlePedidosRoutes(req, res, context) {
     if (method === "DELETE") {
       const body = await readBody(req);
       const orderCode = normalizeText(body.codigo_pedido, 80);
-      const deleteStatus = orderStatuses.includes(body.status) ? body.status : "";
-      const fullDelete = body.full_delete === true && deleteStatus !== "Liberação Parcial";
       if (!orderCode) return send(res, 400, { error: "Pedido inválido." }), true;
 
       const deleted = await tx(async (client) => {
@@ -371,9 +262,7 @@ export async function handlePedidosRoutes(req, res, context) {
           [orderCode]
         );
         if (!rows.rows.length) return [];
-        const rowsToDelete = deleteStatus === "Liberação Parcial" && !fullDelete
-          ? rows.rows.filter((item) => normalizeOrderStatus(item.status) === "Liberação Parcial" && asInt(item.quantidade_liberada) <= 0)
-          : rows.rows;
+        const rowsToDelete = rows.rows;
         if (!rowsToDelete.length) return [];
 
         for (const item of rowsToDelete) {
@@ -386,36 +275,7 @@ export async function handlePedidosRoutes(req, res, context) {
             );
           }
         }
-        if (deleteStatus === "Liberação Parcial" && !fullDelete) {
-          for (const item of rowsToDelete) {
-            await client.query(
-              `UPDATE pedidos
-               SET quantidade_solicitada = quantidade_liberada,
-                   pedido_editado = TRUE,
-                   pedido_editado_em = CURRENT_TIMESTAMP,
-                   pedido_editado_por = $3,
-                   updated_at = CURRENT_TIMESTAMP,
-                   version = COALESCE(version, 1) + 1
-               WHERE codigo_pedido = $1
-                 AND sku_produto = $2
-                 AND status = 'Aguardando Retirada'
-                 AND COALESCE(quantidade_liberada, 0) > 0
-                 AND quantidade_solicitada > quantidade_liberada`,
-              [item.codigo_pedido, item.sku_produto, user.name || "Almoxarifado"]
-            );
-          }
-        }
-
-        const result = deleteStatus === "Liberação Parcial" && !fullDelete
-          ? await client.query(
-              `DELETE FROM pedidos
-               WHERE codigo_pedido = $1
-                 AND status IN ('Liberação Parcial', 'LiberaÃ§Ã£o Parcial', 'Liberado Parcial')
-                 AND COALESCE(quantidade_liberada, 0) <= 0
-               RETURNING id`,
-              [orderCode]
-            )
-          : await client.query("DELETE FROM pedidos WHERE codigo_pedido = $1 RETURNING id", [orderCode]);
+        const result = await client.query("DELETE FROM pedidos WHERE codigo_pedido = $1 RETURNING id", [orderCode]);
         return result.rows;
       });
 
@@ -432,11 +292,11 @@ export async function handlePedidosRoutes(req, res, context) {
     const rows = await query(
       `SELECT p.id, p.codigo_pedido, p.pdv_id, pd.nome AS pdv, p.solicitante, p.sku_produto, pr.nome AS produto,
               p.quantidade_solicitada, p.quantidade_liberada,
+              COALESCE(p.item_origem, 'PDV') AS item_origem,
               CASE
                 WHEN p.status = 'Liberado' THEN 'Finalizado'
                 WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
-                WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 THEN 'Aguardando Retirada'
-                WHEN p.status = 'Liberado Parcial' THEN 'Liberação Parcial'
+                WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') THEN 'Aguardando Retirada'
                 ELSE p.status
               END AS status,
               p.observacao,
@@ -445,8 +305,7 @@ export async function handlePedidosRoutes(req, res, context) {
               p.retirada_observacao, p.retirada_em, p.retirada_usuario_almoxarifado,
               p.version, p.updated_at,
               COALESCE(p.pedido_editado, FALSE) AS pedido_editado, p.pedido_editado_em, p.pedido_editado_por,
-              COALESCE(p.pedido_reaberto_finalizado, FALSE) AS pedido_reaberto_finalizado,
-              COALESCE(p.item_origem, 'PDV') AS item_origem
+              COALESCE(p.pedido_reaberto_finalizado, FALSE) AS pedido_reaberto_finalizado
        FROM pedidos p
        JOIN pdvs pd ON pd.id = p.pdv_id
        JOIN produtos pr ON pr.sku = p.sku_produto
@@ -460,6 +319,115 @@ export async function handlePedidosRoutes(req, res, context) {
     );
     send(res, 200, { orders: rows });
     return true;
+  }
+
+  if ((url.pathname === "/api/admin/orders/add-item" || url.pathname === "/api/admin/orders/add-items") && method === "POST") {
+    if (!requireUser(req, res, "admin")) return true;
+    await ensurePedidoEditColumns();
+    const body = await readBody(req);
+    const orderCode = normalizeText(body.codigo_pedido || body.pedidoId || body.pedido_id, 80);
+    const rawItems = Array.isArray(body.items)
+      ? body.items
+      : [{
+          sku_produto: body.sku_produto || body.sku,
+          quantidade_solicitada: body.quantidade_solicitada || body.quantidade
+        }];
+    const items = rawItems.map((item) => ({
+      sku: normalizeText(item.sku_produto || item.sku, 60),
+      quantidade: asInt(item.quantidade_solicitada || item.quantidade)
+    })).filter((item) => item.sku && item.quantidade > 0);
+    const uniqueSkus = new Set(items.map((item) => item.sku));
+    if (!orderCode || !items.length) return send(res, 400, { error: "Informe o pedido e os produtos que serão adicionados." }), true;
+    if (uniqueSkus.size !== items.length) return send(res, 400, { error: "Remova produtos duplicados antes de adicionar ao pedido." }), true;
+
+    const added = await tx(async (client) => {
+      const orderRows = await client.query(
+        `SELECT codigo_pedido, solicitante, pdv_id, observacao, status
+         FROM pedidos
+         WHERE codigo_pedido = $1
+         ORDER BY id
+         FOR UPDATE`,
+        [orderCode]
+      );
+      if (!orderRows.rows.length) {
+        const error = new Error("Pedido não encontrado.");
+        error.statusCode = 404;
+        throw error;
+      }
+      const order = orderRows.rows[0];
+      const statuses = new Set(orderRows.rows.map((row) => normalizeOrderStatus(row.status)));
+      if (!statuses.has("Em Andamento") || statuses.size !== 1) {
+        const error = new Error("Produtos só podem ser adicionados quando o pedido está Em andamento.");
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const existing = await client.query(
+        `SELECT sku_produto
+         FROM pedidos
+         WHERE codigo_pedido = $1
+           AND sku_produto = ANY($2::text[])`,
+        [orderCode, [...uniqueSkus]]
+      );
+      if (existing.rows.length) {
+        const error = new Error("Este produto já existe no pedido.");
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const products = await client.query(
+        `SELECT sku
+         FROM produtos
+         WHERE sku = ANY($1::text[])
+           AND ativo IS NOT FALSE`,
+        [[...uniqueSkus]]
+      );
+      const foundSkus = new Set(products.rows.map((row) => row.sku));
+      const missing = [...uniqueSkus].filter((sku) => !foundSkus.has(sku));
+      if (missing.length) {
+        const error = new Error(`Produto ${missing[0]} não encontrado ou inativo.`);
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const inserted = [];
+      for (const item of items) {
+        const result = await client.query(
+          `INSERT INTO pedidos
+             (codigo_pedido, solicitante, pdv_id, sku_produto, quantidade_solicitada, quantidade_liberada,
+              status, observacao, data_hora, criado_em, em_andamento_em,
+              pedido_editado, pedido_editado_em, pedido_editado_por, version, updated_at, item_origem)
+           VALUES ($1, $2, $3, $4, $5, 0,
+                   'Em Andamento', $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                   TRUE, CURRENT_TIMESTAMP, $7, 1, CURRENT_TIMESTAMP, 'ALMOX')
+           RETURNING id, codigo_pedido, sku_produto, quantidade_solicitada, item_origem`,
+          [
+            order.codigo_pedido,
+            order.solicitante,
+            order.pdv_id,
+            item.sku,
+            item.quantidade,
+            order.observacao,
+            user.name || "Almoxarifado"
+          ]
+        );
+        inserted.push(result.rows[0]);
+      }
+
+      await client.query(
+        `UPDATE pedidos
+         SET pedido_editado = TRUE,
+             pedido_editado_em = CURRENT_TIMESTAMP,
+             pedido_editado_por = $2,
+             updated_at = CURRENT_TIMESTAMP,
+             version = COALESCE(version, 1) + 1
+         WHERE codigo_pedido = $1`,
+        [orderCode, user.name || "Almoxarifado"]
+      );
+      return inserted;
+    });
+
+    return send(res, 200, { ok: true, items: added, total: added.length }), true;
   }
 
   if (url.pathname === "/api/admin/order-item" && method === "DELETE") {
@@ -481,35 +449,13 @@ export async function handlePedidosRoutes(req, res, context) {
       if (!item) return null;
 
       const currentStatus = normalizeOrderStatus(item.status);
-      if (!["Em Andamento", "Liberação Parcial"].includes(currentStatus)) {
-        const error = new Error("Este produto só pode ser excluído em Em andamento ou Liberação Parcial.");
-        error.statusCode = 400;
-        throw error;
-      }
-      if (currentStatus === "Liberação Parcial" && asInt(item.quantidade_liberada) > 0) {
-        const error = new Error("Não é possível excluir produto já liberado pela Liberação Parcial.");
+      if (currentStatus !== "Em Andamento") {
+        const error = new Error("Este produto só pode ser excluído em Em andamento.");
         error.statusCode = 400;
         throw error;
       }
 
       const result = await client.query("DELETE FROM pedidos WHERE id = $1 RETURNING id, codigo_pedido", [id]);
-      if (currentStatus === "Liberação Parcial") {
-        await client.query(
-          `UPDATE pedidos
-           SET quantidade_solicitada = quantidade_liberada,
-               pedido_editado = TRUE,
-               pedido_editado_em = NOW(),
-               pedido_editado_por = 'Almoxarifado',
-               updated_at = NOW(),
-               version = COALESCE(version, 1) + 1
-           WHERE codigo_pedido = $1
-             AND sku_produto = $2
-             AND status = 'Aguardando Retirada'
-             AND COALESCE(quantidade_liberada, 0) > 0
-             AND quantidade_solicitada > quantidade_liberada`,
-          [item.codigo_pedido, item.sku_produto]
-        );
-      }
       await client.query(
         `UPDATE pedidos
          SET pedido_editado = TRUE,
@@ -525,91 +471,6 @@ export async function handlePedidosRoutes(req, res, context) {
 
     if (!deleted) return send(res, 404, { error: "Produto não encontrado no pedido." }), true;
     send(res, 200, { ok: true, item: deleted });
-    return true;
-  }
-
-  if ((url.pathname === "/api/admin/order-item" || url.pathname === "/api/admin/orders/add-item" || url.pathname === "/api/admin/orders/add-items") && method === "POST") {
-    if (!requireUser(req, res, "admin")) return true;
-    await ensurePedidoEditColumns();
-    const body = await readBody(req);
-    const orderCode = normalizeText(body.codigo_pedido, 80);
-    const rawItems = Array.isArray(body.items) && body.items.length ? body.items : [body];
-    const requestedItems = rawItems.map((item) => ({
-      sku: normalizeText(item.sku_produto || item.sku, 60),
-      qty: asInt(item.quantidade_solicitada || item.quantidade)
-    })).filter((item) => item.sku && item.qty > 0);
-    if (!orderCode || !requestedItems.length) return send(res, 400, { error: "Informe pedido, produto e quantidade." }), true;
-    const duplicatedInput = requestedItems.find((item, index) => requestedItems.findIndex((other) => other.sku === item.sku) !== index);
-    if (duplicatedInput) return send(res, 400, { error: "Remova produtos duplicados antes de adicionar ao pedido." }), true;
-
-    const inserted = await tx(async (client) => {
-      const rows = await client.query(
-        `SELECT codigo_pedido, solicitante, pdv_id, observacao, status
-         FROM pedidos
-         WHERE codigo_pedido = $1
-         ORDER BY id
-         FOR UPDATE`,
-        [orderCode]
-      );
-      if (!rows.rows.length) {
-        const error = new Error("Pedido não encontrado.");
-        error.statusCode = 404;
-        throw error;
-      }
-      const invalidStatus = rows.rows.find((item) => normalizeOrderStatus(item.status) !== "Em Andamento");
-      if (invalidStatus) {
-        const error = new Error("Produtos só podem ser adicionados quando o pedido está Em andamento.");
-        error.statusCode = 400;
-        throw error;
-      }
-      const base = rows.rows[0];
-      const skus = requestedItems.map((item) => item.sku);
-      const products = await client.query("SELECT sku, nome, ativo FROM produtos WHERE sku = ANY($1::text[]) AND ativo IS NOT FALSE", [skus]);
-      const productsBySku = new Map(products.rows.map((product) => [product.sku, product]));
-      const missingProduct = requestedItems.find((item) => !productsBySku.has(item.sku));
-      if (missingProduct) {
-        const error = new Error(`Produto ${missingProduct.sku} não encontrado ou inativo.`);
-        error.statusCode = 400;
-        throw error;
-      }
-      const duplicate = await client.query(
-        "SELECT sku_produto FROM pedidos WHERE codigo_pedido = $1 AND sku_produto = ANY($2::text[])",
-        [orderCode, skus]
-      );
-      if (duplicate.rows.length) {
-        const error = new Error("Este produto já existe no pedido. Altere a quantidade liberada na linha existente.");
-        error.statusCode = 400;
-        throw error;
-      }
-      const insertedRows = [];
-      for (const item of requestedItems) {
-        const product = productsBySku.get(item.sku);
-        const result = await client.query(
-          `INSERT INTO pedidos
-             (codigo_pedido, solicitante, pdv_id, sku_produto, quantidade_solicitada, quantidade_liberada,
-              status, observacao, criado_em, data_hora, em_andamento_em,
-              pedido_editado, pedido_editado_em, pedido_editado_por, version, updated_at, item_origem)
-           VALUES ($1, $2, $3, $4, $5, 0, 'Em Andamento', $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
-                   CURRENT_TIMESTAMP, TRUE, CURRENT_TIMESTAMP, $7, 1, CURRENT_TIMESTAMP, 'ALMOX')
-           RETURNING id, codigo_pedido, sku_produto, quantidade_solicitada, item_origem`,
-          [orderCode, base.solicitante, base.pdv_id, item.sku, item.qty, base.observacao, user.name || "Almoxarifado"]
-        );
-        insertedRows.push({ ...result.rows[0], produto: product.nome });
-      }
-      await client.query(
-        `UPDATE pedidos
-         SET pedido_editado = TRUE,
-             pedido_editado_em = CURRENT_TIMESTAMP,
-             pedido_editado_por = $2,
-             updated_at = CURRENT_TIMESTAMP,
-             version = COALESCE(version, 1) + 1
-         WHERE codigo_pedido = $1`,
-        [orderCode, user.name || "Almoxarifado"]
-      );
-      return insertedRows;
-    });
-
-    send(res, 201, { ok: true, items: inserted, item: inserted[0] || null });
     return true;
   }
 
@@ -650,13 +511,8 @@ export async function handlePedidosRoutes(req, res, context) {
           error.statusCode = 409;
           throw error;
         }
-        if (!["Em Andamento", "Liberação Parcial"].includes(currentStatus)) {
-          const error = new Error("Produtos só podem ser excluídos em Em andamento ou Liberação Parcial.");
-          error.statusCode = 400;
-          throw error;
-        }
-        if (currentStatus === "Liberação Parcial" && asInt(item.quantidade_liberada) > 0) {
-          const error = new Error("Não é possível excluir produto já liberado pela Liberação Parcial.");
+        if (currentStatus !== "Em Andamento") {
+          const error = new Error("Produtos só podem ser excluídos em Em andamento.");
           error.statusCode = 400;
           throw error;
         }
@@ -666,25 +522,6 @@ export async function handlePedidosRoutes(req, res, context) {
           error.statusCode = 409;
           throw error;
         }
-      }
-
-      const partialRows = rows.rows.filter((item) => normalizeOrderStatus(item.status) === "Liberação Parcial");
-      for (const item of partialRows) {
-        await client.query(
-          `UPDATE pedidos
-           SET quantidade_solicitada = quantidade_liberada,
-               pedido_editado = TRUE,
-               pedido_editado_em = NOW(),
-               pedido_editado_por = $3,
-               updated_at = NOW(),
-               version = COALESCE(version, 1) + 1
-           WHERE codigo_pedido = $1
-             AND sku_produto = $2
-             AND status = 'Aguardando Retirada'
-             AND COALESCE(quantidade_liberada, 0) > 0
-             AND quantidade_solicitada > quantidade_liberada`,
-          [item.codigo_pedido, item.sku_produto, user.name || "Almoxarifado"]
-        );
       }
 
       const deleted = await client.query(
@@ -749,7 +586,7 @@ export async function handlePedidosRoutes(req, res, context) {
           const currentStatus = normalizeOrderStatus(current.status);
           const allowedTransitions = {
             Pendente: ["Em Andamento"],
-            "Em Andamento": ["Pendente", "Aguardando Retirada", "Liberação Parcial"],
+            "Em Andamento": ["Pendente", "Aguardando Retirada"],
             "Aguardando Retirada": ["Em Andamento"],
             "Liberação Parcial": ["Em Andamento", "Aguardando Retirada"],
             Finalizado: ["Em Andamento"]
@@ -835,7 +672,7 @@ export async function handlePedidosRoutes(req, res, context) {
            WHERE codigo_pedido = $1
              AND ($2::text = '' OR CASE
                WHEN status = 'Liberado' THEN 'Finalizado'
-               WHEN status = 'Liberado Parcial' THEN 'Liberação Parcial'
+               WHEN status IN ('Liberado Parcial', 'Liberação Parcial') THEN 'Aguardando Retirada'
                ELSE status
              END = $2)
            ORDER BY id
@@ -854,8 +691,6 @@ export async function handlePedidosRoutes(req, res, context) {
         error.statusCode = 400;
         throw error;
       }
-      let partialHasReleased = false;
-      let partialHasMissing = false;
       let changedItems = 0;
       for (const item of items) {
         const old = await client.query("SELECT codigo_pedido, status, quantidade_solicitada, quantidade_liberada, pdv_id, sku_produto, version FROM pedidos WHERE id = $1", [asInt(item.id)]);
@@ -864,7 +699,7 @@ export async function handlePedidosRoutes(req, res, context) {
         const currentStatus = normalizeOrderStatus(current.status);
         const allowedTransitions = {
           Pendente: ["Em Andamento"],
-          "Em Andamento": ["Pendente", "Aguardando Retirada", "Liberação Parcial"],
+          "Em Andamento": ["Pendente", "Aguardando Retirada"],
           "Aguardando Retirada": ["Em Andamento"],
           "Liberação Parcial": ["Em Andamento", "Aguardando Retirada"],
           Finalizado: ["Em Andamento"]
@@ -900,9 +735,7 @@ export async function handlePedidosRoutes(req, res, context) {
         }
         const requestedQty = asInt(current.quantidade_solicitada);
         let qty = asInt(current.quantidade_liberada);
-        if (currentStatus === "Em Andamento" && nextStatus === "Liberação Parcial") {
-          qty = asInt(item.quantidade_liberada);
-        } else if (["Em Andamento", "Liberação Parcial"].includes(currentStatus) && nextStatus === "Aguardando Retirada") {
+        if (["Em Andamento", "Liberação Parcial"].includes(currentStatus) && nextStatus === "Aguardando Retirada") {
           const requestedReleaseQty = asInt(item.quantidade_liberada);
           qty = releaseMode === "entered-only"
             ? requestedReleaseQty
@@ -920,53 +753,11 @@ export async function handlePedidosRoutes(req, res, context) {
         if (releaseMode === "entered-only" && nextStatus === "Aguardando Retirada" && qty <= 0) {
           continue;
         }
-        if (nextStatus === "Liberação Parcial") {
-          partialHasReleased ||= qty > 0;
-          partialHasMissing ||= qty < requestedQty;
-        }
-        if (nextStatus === "Liberação Parcial" && qty > 0 && qty < requestedQty) {
-          const missingQty = requestedQty - qty;
-          await client.query(
-            `INSERT INTO pedidos
-               (codigo_pedido, solicitante, pdv_id, sku_produto, quantidade_solicitada, quantidade_liberada,
-                status, observacao, criado_em, data_hora, liberado_em, pronto_retirada_em,
-                pedido_editado, pedido_editado_em, pedido_editado_por, version, updated_at)
-             SELECT codigo_pedido, solicitante, pdv_id, sku_produto, $2, 0,
-                    'Liberação Parcial', observacao, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL, NULL,
-                    TRUE, CURRENT_TIMESTAMP, $3, 1, CURRENT_TIMESTAMP
-             FROM pedidos
-             WHERE id = $1`,
-            [asInt(item.id), missingQty, user.name || "Almoxarifado"]
-          );
-          await client.query(
-            `UPDATE pedidos
-             SET status = 'Aguardando Retirada',
-                 quantidade_liberada = $2,
-                 liberado_em = CURRENT_TIMESTAMP,
-                 pronto_retirada_em = CURRENT_TIMESTAMP,
-                 pedido_editado = TRUE,
-                 pedido_editado_em = CURRENT_TIMESTAMP,
-                 pedido_editado_por = $3,
-                 retirada_assinatura = NULL,
-                 retirada_responsavel = NULL,
-                 retirada_observacao = NULL,
-                 retirada_em = NULL,
-                 retirada_usuario_almoxarifado = NULL,
-                 release_mode = NULL,
-                 version = COALESCE(version, 1) + 1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1`,
-            [asInt(item.id), qty, user.name || "Almoxarifado"]
-          );
-          continue;
-        }
-        const itemStatus = nextStatus === "Liberação Parcial" && qty > 0
-          ? "Aguardando Retirada"
-          : nextStatus;
+        const itemStatus = nextStatus;
 
         const timeField = itemStatus === "Em Andamento"
           ? ", em_andamento_em = CURRENT_TIMESTAMP"
-          : ["Aguardando Retirada", "Liberação Parcial"].includes(itemStatus)
+          : itemStatus === "Aguardando Retirada"
             ? ", liberado_em = CURRENT_TIMESTAMP, pronto_retirada_em = CURRENT_TIMESTAMP"
             : "";
         await client.query(
@@ -1048,11 +839,6 @@ export async function handlePedidosRoutes(req, res, context) {
           );
         }
       }
-      if (nextStatus === "Liberação Parcial" && (!partialHasReleased || !partialHasMissing)) {
-        const error = new Error("Para liberar parcialmente, informe ao menos um produto liberado e mantenha ao menos um produto com falta de envio.");
-        error.statusCode = 400;
-        throw error;
-      }
       if (releaseMode === "entered-only" && nextStatus === "Aguardando Retirada" && changedItems === 0) {
         const error = new Error("Informe a quantidade que deseja liberar em pelo menos um produto.");
         error.statusCode = 400;
@@ -1097,11 +883,16 @@ export async function handlePedidosRoutes(req, res, context) {
         ...row,
         normalizedStatus: normalizeOrderStatus(row.status)
       }));
-      const targetStatus = requestedStatus && ["Aguardando Retirada", "Liberação Parcial"].includes(requestedStatus)
+      const targetStatus = requestedStatus === "Aguardando Retirada"
         ? requestedStatus
         : normalizedRows.some((row) => row.normalizedStatus === "Aguardando Retirada")
           ? "Aguardando Retirada"
-          : "Liberação Parcial";
+          : "";
+      if (!targetStatus) {
+        const error = new Error("Não há produtos aguardando retirada para confirmar.");
+        error.statusCode = 400;
+        throw error;
+      }
       const targetRows = normalizedRows.filter((row) => row.normalizedStatus === targetStatus);
       if (!targetRows.length) {
         const error = new Error("Não há produtos deste status para confirmar a retirada.");
@@ -1113,8 +904,8 @@ export async function handlePedidosRoutes(req, res, context) {
         error.statusCode = 400;
         throw error;
       }
-      if (targetRows.some((row) => !["Aguardando Retirada", "Liberação Parcial"].includes(row.normalizedStatus))) {
-        const error = new Error("A retirada só pode ser confirmada para pedidos aguardando retirada ou liberação parcial.");
+      if (targetRows.some((row) => row.normalizedStatus !== "Aguardando Retirada")) {
+        const error = new Error("A retirada só pode ser confirmada para pedidos aguardando retirada.");
         error.statusCode = 400;
         throw error;
       }
@@ -1125,17 +916,6 @@ export async function handlePedidosRoutes(req, res, context) {
       }
       for (const row of targetRows) {
         const qty = asInt(row.quantidade_liberada);
-        const requestedQty = asInt(row.quantidade_solicitada);
-        const missingQty = Math.max(requestedQty - qty, 0);
-        const suppressRemainder = row.release_mode === "entered-only";
-        const hasSeparateRemainder = missingQty > 0
-          ? normalizedRows.some((candidate) =>
-              candidate.id !== row.id
-              && candidate.sku_produto === row.sku_produto
-              && candidate.normalizedStatus === "Liberação Parcial"
-              && asInt(candidate.quantidade_liberada) <= 0
-            )
-          : false;
         await client.query("UPDATE produtos SET qtd_total = qtd_total - $1 WHERE sku = $2", [qty, row.sku_produto]);
         await client.query(
           `INSERT INTO estoque_pdv (pdv_id, sku_produto, quantidade)
@@ -1143,38 +923,6 @@ export async function handlePedidosRoutes(req, res, context) {
            ON CONFLICT (pdv_id, sku_produto) DO UPDATE SET quantidade = estoque_pdv.quantidade + EXCLUDED.quantidade`,
           [row.pdv_id, row.sku_produto, qty]
         );
-        if (missingQty > 0 && !hasSeparateRemainder && !suppressRemainder) {
-          const existingRemainder = await client.query(
-            `SELECT id
-             FROM pedidos
-             WHERE codigo_pedido = $1
-               AND sku_produto = $2
-               AND status IN ('Liberação Parcial', 'Liberado Parcial')
-               AND COALESCE(quantidade_liberada, 0) <= 0
-             ORDER BY id
-             LIMIT 1`,
-            [row.codigo_pedido, row.sku_produto]
-          );
-          if (!existingRemainder.rows[0]) {
-            await client.query(
-              `INSERT INTO pedidos
-                 (codigo_pedido, solicitante, pdv_id, sku_produto, quantidade_solicitada, quantidade_liberada,
-                  status, observacao, criado_em, data_hora, pedido_editado, pedido_editado_em, pedido_editado_por,
-                  version, updated_at)
-               VALUES ($1, $2, $3, $4, $5, 0, 'Liberação Parcial', $6,
-                       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, TRUE, CURRENT_TIMESTAMP, $7, 1, CURRENT_TIMESTAMP)`,
-              [
-                row.codigo_pedido,
-                row.solicitante,
-                row.pdv_id,
-                row.sku_produto,
-                missingQty,
-                row.observacao,
-                user.name || "Almoxarifado"
-              ]
-            );
-          }
-        }
       }
       const finalized = await client.query(
         `UPDATE pedidos
@@ -1243,17 +991,16 @@ export async function handlePedidosRoutes(req, res, context) {
     const rows = await query(
       `SELECT p.id, p.data_hora, p.codigo_pedido, pd.nome AS pdv, p.solicitante, p.observacao,
               pr.nome AS produto, p.quantidade_solicitada, p.quantidade_liberada,
+              COALESCE(p.item_origem, 'PDV') AS item_origem,
               p.retirada_assinatura, p.retirada_responsavel, p.retirada_em, p.retirada_usuario_almoxarifado,
               CASE
                 WHEN p.status = 'Liberado' THEN 'Finalizado'
                 WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
-                WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 THEN 'Aguardando Retirada'
-                WHEN p.status = 'Liberado Parcial' THEN 'Liberação Parcial'
+                WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') THEN 'Aguardando Retirada'
                 ELSE p.status
               END AS status,
               COALESCE(p.pedido_editado, FALSE) AS pedido_editado, p.pedido_editado_em, p.pedido_editado_por,
-              COALESCE(p.pedido_reaberto_finalizado, FALSE) AS pedido_reaberto_finalizado,
-              COALESCE(p.item_origem, 'PDV') AS item_origem
+              COALESCE(p.pedido_reaberto_finalizado, FALSE) AS pedido_reaberto_finalizado
        FROM pedidos p
        JOIN pdvs pd ON pd.id = p.pdv_id
        JOIN produtos pr ON pr.sku = p.sku_produto
@@ -1262,8 +1009,7 @@ export async function handlePedidosRoutes(req, res, context) {
          AND ($3::text IS NULL OR CASE
                 WHEN p.status = 'Liberado' THEN 'Finalizado'
                 WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
-                WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 THEN 'Aguardando Retirada'
-                WHEN p.status = 'Liberado Parcial' THEN 'Liberação Parcial'
+                WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') THEN 'Aguardando Retirada'
                 ELSE p.status
               END = $3)
          AND ($4::date IS NULL OR p.data_hora::date >= $4::date)

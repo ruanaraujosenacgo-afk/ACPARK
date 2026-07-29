@@ -13,8 +13,6 @@ const rootDir = path.resolve(__dirname, "..");
 types.setTypeParser(1114, (value) => value);
 
 function readStreamlitSecret() {
-  if (process.env.VERCEL || process.env.NODE_ENV === "production") return null;
-
   const file = path.join(rootDir, ".streamlit", "secrets.toml");
   if (!fs.existsSync(file)) return null;
 
@@ -43,10 +41,20 @@ parsedConnection.searchParams.delete("sslmode");
 const connectionString = parsedConnection.toString();
 const hostname = parsedConnection.hostname.toLowerCase();
 const usesHostedPostgres = sslmode !== "disable" && !["localhost", "127.0.0.1", "::1"].includes(hostname);
+const configuredPoolMax = Number(process.env.PGPOOL_MAX || process.env.DB_POOL_MAX || 0);
+const poolMax = Number.isFinite(configuredPoolMax) && configuredPoolMax > 0
+  ? configuredPoolMax
+  : usesHostedPostgres
+    ? 1
+    : 10;
 
 export const pool = new Pool({
   connectionString,
   ssl: usesHostedPostgres ? { rejectUnauthorized: false } : undefined,
+  max: poolMax,
+  idleTimeoutMillis: 10_000,
+  connectionTimeoutMillis: 5_000,
+  allowExitOnIdle: true,
   // Supabase transaction pooler does not work well with traditional prepared statements.
   prepareThreshold: 0
 });

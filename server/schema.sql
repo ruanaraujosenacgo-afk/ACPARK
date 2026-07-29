@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS pdvs (
   nome TEXT UNIQUE NOT NULL,
   senha TEXT NOT NULL,
   is_cozinha BOOLEAN DEFAULT FALSE,
+  codigo_orion TEXT UNIQUE,
   categoria TEXT
 );
 
@@ -28,22 +29,11 @@ CREATE TABLE IF NOT EXISTS estoque_pdv (
   pdv_id INTEGER REFERENCES pdvs(id) ON DELETE CASCADE,
   sku_produto TEXT REFERENCES produtos(sku) ON DELETE CASCADE,
   quantidade INTEGER DEFAULT 0,
-  saldo_omie NUMERIC DEFAULT 0,
-  quantidade_reservada_acpark NUMERIC DEFAULT 0,
-  saldo_disponivel_acpark NUMERIC GENERATED ALWAYS AS (COALESCE(saldo_omie, 0) - COALESCE(quantidade_reservada_acpark, 0)) STORED,
-  ultima_sincronizacao TIMESTAMP,
-  sincronizacao_status TEXT DEFAULT 'MANUAL',
   estoque_minimo INTEGER DEFAULT 0,
   estoque_maximo INTEGER DEFAULT 0,
   permitido BOOLEAN DEFAULT FALSE,
   UNIQUE(pdv_id, sku_produto)
 );
-
-ALTER TABLE estoque_pdv ADD COLUMN IF NOT EXISTS saldo_omie NUMERIC DEFAULT 0;
-ALTER TABLE estoque_pdv ADD COLUMN IF NOT EXISTS quantidade_reservada_acpark NUMERIC DEFAULT 0;
-ALTER TABLE estoque_pdv ADD COLUMN IF NOT EXISTS saldo_disponivel_acpark NUMERIC GENERATED ALWAYS AS (COALESCE(saldo_omie, 0) - COALESCE(quantidade_reservada_acpark, 0)) STORED;
-ALTER TABLE estoque_pdv ADD COLUMN IF NOT EXISTS ultima_sincronizacao TIMESTAMP;
-ALTER TABLE estoque_pdv ADD COLUMN IF NOT EXISTS sincronizacao_status TEXT DEFAULT 'MANUAL';
 
 CREATE TABLE IF NOT EXISTS pdv_categorias (
   id SERIAL PRIMARY KEY,
@@ -136,23 +126,16 @@ ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS pedido_editado_por TEXT;
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS pedido_reaberto_finalizado BOOLEAN DEFAULT FALSE;
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS release_mode TEXT;
 ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS item_origem TEXT DEFAULT 'PDV';
-UPDATE pedidos SET item_origem = 'PDV' WHERE item_origem IS NULL OR trim(item_origem) = '';
 
 UPDATE pedidos SET version = 1 WHERE version IS NULL;
 UPDATE pedidos SET updated_at = COALESCE(updated_at, criado_em, data_hora, CURRENT_TIMESTAMP);
 UPDATE pedidos SET status = 'Finalizado' WHERE status = 'Liberado';
-UPDATE pedidos SET status = 'Liberação Parcial' WHERE status = 'Liberado Parcial';
+UPDATE pedidos SET status = 'Aguardando Retirada' WHERE status = 'Liberado Parcial';
 UPDATE pedidos
 SET status = 'Aguardando Retirada',
     updated_at = CURRENT_TIMESTAMP
 WHERE status = 'Aguardando Retirada'
   AND COALESCE(quantidade_liberada, 0) >= COALESCE(quantidade_solicitada, 0);
-UPDATE pedidos
-SET status = 'Liberação Parcial',
-    updated_at = CURRENT_TIMESTAMP
-WHERE status = 'Aguardando Retirada'
-  AND COALESCE(quantidade_liberada, 0) > 0
-  AND COALESCE(quantidade_liberada, 0) < COALESCE(quantidade_solicitada, 0);
 UPDATE pedidos
 SET status = 'Finalizado',
     updated_at = CURRENT_TIMESTAMP
@@ -163,7 +146,6 @@ UPDATE pedidos
 SET status = 'Aguardando Retirada',
     updated_at = CURRENT_TIMESTAMP
 WHERE status = 'Liberação Parcial'
-  AND COALESCE(quantidade_liberada, 0) > 0
   AND retirada_assinatura IS NULL;
 
 CREATE TABLE IF NOT EXISTS configuracoes (
@@ -171,326 +153,54 @@ CREATE TABLE IF NOT EXISTS configuracoes (
   valor TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS integrations (
+CREATE TABLE IF NOT EXISTS user_order_alert_preferences (
   id BIGSERIAL PRIMARY KEY,
-  nome TEXT NOT NULL,
-  provedor TEXT NOT NULL,
-  tipo TEXT NOT NULL,
-  ambiente TEXT NOT NULL DEFAULT 'PRODUCAO',
-  url_base TEXT,
-  empresa_vinculada TEXT,
-  ativo BOOLEAN NOT NULL DEFAULT TRUE,
-  status TEXT NOT NULL DEFAULT 'PENDENTE',
-  ultima_sincronizacao TIMESTAMP,
-  last_error TEXT,
-  last_connection_test_at TIMESTAMP,
-  last_connection_duration_ms INTEGER,
-  last_connection_message TEXT,
-  stock_mode TEXT NOT NULL DEFAULT 'MANUAL',
-  sync_intervals JSONB DEFAULT '{}'::jsonb,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  user_key TEXT NOT NULL UNIQUE,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  sound_id VARCHAR(100) NOT NULL DEFAULT 'repetitive-alert',
+  volume INTEGER NOT NULL DEFAULT 70,
+  visual_notifications BOOLEAN NOT NULL DEFAULT TRUE,
+  repeat_mode VARCHAR(40) NOT NULL DEFAULT 'three_times',
+  repeat_interval_seconds INTEGER NOT NULL DEFAULT 5,
+  stop_on_view BOOLEAN NOT NULL DEFAULT TRUE,
+  stop_on_service_start BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS order_alert_sounds (
+  id BIGSERIAL PRIMARY KEY,
+  sound_key VARCHAR(100) NOT NULL UNIQUE,
+  display_name VARCHAR(150) NOT NULL,
+  storage_path VARCHAR(500),
+  mime_type VARCHAR(100),
+  size_bytes BIGINT DEFAULT 0,
+  duration_seconds NUMERIC,
+  is_system BOOLEAN NOT NULL DEFAULT FALSE,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_by TEXT,
-  updated_by TEXT
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-ALTER TABLE integrations ADD COLUMN IF NOT EXISTS last_connection_test_at TIMESTAMP;
-ALTER TABLE integrations ADD COLUMN IF NOT EXISTS last_connection_duration_ms INTEGER;
-ALTER TABLE integrations ADD COLUMN IF NOT EXISTS last_connection_message TEXT;
-ALTER TABLE integrations ADD COLUMN IF NOT EXISTS stock_mode TEXT NOT NULL DEFAULT 'MANUAL';
-
-CREATE TABLE IF NOT EXISTS integration_credentials (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT NOT NULL REFERENCES integrations(id) ON DELETE CASCADE,
-  credential_key TEXT NOT NULL,
-  encrypted_value TEXT NOT NULL,
-  masked_value TEXT,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (integration_id, credential_key)
-);
-
-CREATE TABLE IF NOT EXISTS integration_jobs (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE SET NULL,
-  job_type TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'PENDENTE',
-  priority TEXT NOT NULL DEFAULT 'NORMAL',
-  priority_rank INTEGER NOT NULL DEFAULT 50,
-  payload JSONB DEFAULT '{}'::jsonb,
-  result JSONB,
-  attempts INTEGER NOT NULL DEFAULT 0,
-  current_page INTEGER DEFAULT 1,
-  cursor TEXT,
-  date_from TIMESTAMP,
-  date_to TIMESTAMP,
-  last_external_id TEXT,
-  last_processed_at TIMESTAMP,
-  next_run_at TIMESTAMP,
-  last_error TEXT,
-  idempotency_key TEXT UNIQUE,
-  locked_at TIMESTAMP,
-  locked_by TEXT,
-  completed_at TIMESTAMP,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'NORMAL';
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS priority_rank INTEGER NOT NULL DEFAULT 50;
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS current_page INTEGER DEFAULT 1;
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS cursor TEXT;
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS date_from TIMESTAMP;
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS date_to TIMESTAMP;
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS last_external_id TEXT;
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS last_processed_at TIMESTAMP;
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP;
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS locked_by TEXT;
-ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP;
-
-CREATE TABLE IF NOT EXISTS integration_attempts (
-  id BIGSERIAL PRIMARY KEY,
-  job_id BIGINT REFERENCES integration_jobs(id) ON DELETE CASCADE,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE SET NULL,
-  status TEXT NOT NULL,
-  error_message TEXT,
-  response_summary JSONB,
-  started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  finished_at TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS integration_webhooks (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE SET NULL,
-  provider TEXT NOT NULL,
-  event_type TEXT,
-  signature_valid BOOLEAN DEFAULT FALSE,
-  raw_payload JSONB,
-  headers JSONB,
-  status TEXT NOT NULL DEFAULT 'RECEBIDO',
-  processing_error TEXT,
-  received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  processed_at TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS integration_sync_state (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE CASCADE,
-  scope TEXT NOT NULL,
-  last_success_at TIMESTAMP,
-  last_attempt_at TIMESTAMP,
-  last_movement_id TEXT,
-  last_page INTEGER DEFAULT 1,
-  last_cursor TEXT,
-  overlap_start_at TIMESTAMP,
-  last_error TEXT,
-  stats JSONB DEFAULT '{}'::jsonb,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (integration_id, scope)
-);
-
-CREATE TABLE IF NOT EXISTS integration_runtime_state (
-  integration_id BIGINT PRIMARY KEY REFERENCES integrations(id) ON DELETE CASCADE,
-  circuit_state TEXT NOT NULL DEFAULT 'CLOSED',
-  consecutive_failures INTEGER NOT NULL DEFAULT 0,
-  opened_at TIMESTAMP,
-  half_open_after TIMESTAMP,
-  last_request_at TIMESTAMP,
-  request_window_start TIMESTAMP,
-  request_count INTEGER NOT NULL DEFAULT 0,
-  max_concurrent_requests INTEGER NOT NULL DEFAULT 1,
-  max_requests_per_second INTEGER NOT NULL DEFAULT 2,
-  minimum_interval_ms INTEGER NOT NULL DEFAULT 500,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS integration_metrics (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE SET NULL,
-  metric_name TEXT NOT NULL,
-  metric_value NUMERIC NOT NULL DEFAULT 0,
-  labels JSONB DEFAULT '{}'::jsonb,
-  recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS stock_refresh_queue (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE CASCADE,
-  omie_product_id TEXT NOT NULL,
-  omie_location_id TEXT NOT NULL,
-  trigger TEXT,
-  external_reference TEXT,
-  status TEXT NOT NULL DEFAULT 'PENDENTE',
-  available_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP + INTERVAL '1 second',
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (integration_id, omie_product_id, omie_location_id, status)
-);
-
-CREATE TABLE IF NOT EXISTS product_sync_temperature (
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE CASCADE,
-  external_product_id TEXT NOT NULL,
-  sku_produto TEXT REFERENCES produtos(sku) ON DELETE SET NULL,
-  temperature TEXT NOT NULL DEFAULT 'FRIO',
-  reason TEXT,
-  last_movement_at TIMESTAMP,
-  last_classified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (integration_id, external_product_id)
-);
-
-CREATE TABLE IF NOT EXISTS product_integration_mappings (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE CASCADE,
-  sku_produto TEXT REFERENCES produtos(sku) ON DELETE CASCADE,
-  external_product_id TEXT NOT NULL,
-  external_code TEXT,
-  integration_code TEXT,
-  product_type TEXT DEFAULT 'REVENDA',
-  unit TEXT DEFAULT 'UN',
-  family TEXT,
-  ean TEXT,
-  ncm TEXT,
-  price NUMERIC,
-  stock_control TEXT,
-  review_status TEXT NOT NULL DEFAULT 'PENDENTE_REVISAO',
-  raw_payload JSONB,
-  active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (integration_id, sku_produto, external_product_id),
-  UNIQUE (integration_id, external_product_id)
-);
-
-ALTER TABLE product_integration_mappings ADD COLUMN IF NOT EXISTS external_code TEXT;
-ALTER TABLE product_integration_mappings ADD COLUMN IF NOT EXISTS integration_code TEXT;
-ALTER TABLE product_integration_mappings ADD COLUMN IF NOT EXISTS unit TEXT DEFAULT 'UN';
-ALTER TABLE product_integration_mappings ADD COLUMN IF NOT EXISTS family TEXT;
-ALTER TABLE product_integration_mappings ADD COLUMN IF NOT EXISTS ean TEXT;
-ALTER TABLE product_integration_mappings ADD COLUMN IF NOT EXISTS ncm TEXT;
-ALTER TABLE product_integration_mappings ADD COLUMN IF NOT EXISTS price NUMERIC;
-ALTER TABLE product_integration_mappings ADD COLUMN IF NOT EXISTS stock_control TEXT;
-ALTER TABLE product_integration_mappings ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'PENDENTE_REVISAO';
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_product_integration_external_unique
-  ON product_integration_mappings(integration_id, external_product_id);
-
-CREATE TABLE IF NOT EXISTS omie_stock_locations (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE CASCADE,
-  omie_location_id TEXT NOT NULL,
-  code TEXT,
-  name TEXT NOT NULL,
-  description TEXT,
-  active BOOLEAN NOT NULL DEFAULT TRUE,
-  company TEXT,
-  raw_payload JSONB,
-  synced_at TIMESTAMP,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (integration_id, omie_location_id)
-);
-
-CREATE TABLE IF NOT EXISTS pdv_stock_location_mappings (
-  id BIGSERIAL PRIMARY KEY,
-  pdv_acpark_id INTEGER REFERENCES pdvs(id) ON DELETE CASCADE,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE CASCADE,
-  omie_location_id TEXT NOT NULL,
-  omie_location_name TEXT,
-  active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (pdv_acpark_id, integration_id, omie_location_id)
-);
-
-CREATE TABLE IF NOT EXISTS stock_movements (
-  id BIGSERIAL PRIMARY KEY,
-  omie_movement_id TEXT UNIQUE,
-  operation_type TEXT NOT NULL,
-  origin_system TEXT NOT NULL,
-  external_reference TEXT,
-  idempotency_key TEXT UNIQUE,
-  pdv_id INTEGER REFERENCES pdvs(id) ON DELETE SET NULL,
-  omie_location_id TEXT,
-  status TEXT NOT NULL DEFAULT 'PENDENTE',
-  movement_date TIMESTAMP,
-  synced_at TIMESTAMP,
-  error_message TEXT,
-  raw_payload JSONB,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS stock_movement_items (
-  id BIGSERIAL PRIMARY KEY,
-  movement_id BIGINT REFERENCES stock_movements(id) ON DELETE CASCADE,
-  sku_produto TEXT REFERENCES produtos(sku) ON DELETE SET NULL,
-  quantity NUMERIC NOT NULL,
-  unit TEXT DEFAULT 'UN',
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS stock_snapshots (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE SET NULL,
-  pdv_id INTEGER REFERENCES pdvs(id) ON DELETE SET NULL,
-  sku_produto TEXT REFERENCES produtos(sku) ON DELETE SET NULL,
-  omie_location_id TEXT,
-  saldo_omie NUMERIC NOT NULL DEFAULT 0,
-  quantidade_reservada_acpark NUMERIC NOT NULL DEFAULT 0,
-  saldo_disponivel_acpark NUMERIC NOT NULL DEFAULT 0,
-  sync_status TEXT NOT NULL DEFAULT 'SINCRONIZADO',
-  synced_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  raw_payload JSONB
-);
-
-CREATE TABLE IF NOT EXISTS stock_reconciliations (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE SET NULL,
-  status TEXT NOT NULL DEFAULT 'PENDENTE',
-  differences_count INTEGER NOT NULL DEFAULT 0,
-  started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  finished_at TIMESTAMP,
-  summary JSONB,
-  error_message TEXT
-);
-
-CREATE TABLE IF NOT EXISTS stock_reconciliation_items (
-  id BIGSERIAL PRIMARY KEY,
-  reconciliation_id BIGINT REFERENCES stock_reconciliations(id) ON DELETE CASCADE,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE SET NULL,
-  pdv_id INTEGER REFERENCES pdvs(id) ON DELETE SET NULL,
-  sku_produto TEXT REFERENCES produtos(sku) ON DELETE SET NULL,
-  omie_location_id TEXT,
-  difference_type TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'PENDENTE',
-  details JSONB DEFAULT '{}'::jsonb,
-  reviewed_by TEXT,
-  reviewed_at TIMESTAMP,
-  note TEXT,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS integration_audit_logs (
-  id BIGSERIAL PRIMARY KEY,
-  integration_id BIGINT REFERENCES integrations(id) ON DELETE SET NULL,
-  action TEXT NOT NULL,
-  actor TEXT,
-  details JSONB DEFAULT '{}'::jsonb,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+INSERT INTO order_alert_sounds (sound_key, display_name, is_system, is_active)
+VALUES
+  ('default', 'Alerta padrao', TRUE, TRUE),
+  ('bell', 'Campainha curta', TRUE, TRUE),
+  ('soft', 'Toque suave', TRUE, TRUE),
+  ('chime', 'Chime', TRUE, TRUE),
+  ('double', 'Toque duplo', TRUE, TRUE),
+  ('repetitive-alert', 'Alerta repetitivo', TRUE, TRUE),
+  ('repetitive-bell', 'Campainha repetitiva', TRUE, TRUE),
+  ('urgent', 'Chamada urgente', TRUE, TRUE),
+  ('waiting', 'Pedido aguardando', TRUE, TRUE),
+  ('soft-continuous', 'Alerta continuo suave', TRUE, TRUE)
+ON CONFLICT (sound_key) DO UPDATE
+SET display_name = EXCLUDED.display_name,
+    is_system = TRUE,
+    is_active = TRUE;
 
 CREATE INDEX IF NOT EXISTS idx_pedidos_pdv_data ON pedidos(pdv_id, data_hora DESC);
 CREATE INDEX IF NOT EXISTS idx_pedidos_status ON pedidos(status);
 CREATE INDEX IF NOT EXISTS idx_produto_categorias_categoria ON produto_categorias(categoria);
-CREATE INDEX IF NOT EXISTS idx_integrations_provider ON integrations(provedor, ativo);
-CREATE INDEX IF NOT EXISTS idx_integration_jobs_status ON integration_jobs(status, next_run_at);
-CREATE INDEX IF NOT EXISTS idx_integration_jobs_priority ON integration_jobs(status, priority_rank DESC, created_at);
-CREATE INDEX IF NOT EXISTS idx_integration_sync_state_lookup ON integration_sync_state(integration_id, scope);
-CREATE INDEX IF NOT EXISTS idx_integration_metrics_lookup ON integration_metrics(integration_id, metric_name, recorded_at DESC);
-CREATE INDEX IF NOT EXISTS idx_stock_refresh_queue_ready ON stock_refresh_queue(status, available_at, integration_id);
-CREATE INDEX IF NOT EXISTS idx_omie_stock_locations_lookup ON omie_stock_locations(integration_id, active, name);
-CREATE INDEX IF NOT EXISTS idx_stock_movements_origin ON stock_movements(origin_system, operation_type, movement_date DESC);
-CREATE INDEX IF NOT EXISTS idx_stock_snapshots_lookup ON stock_snapshots(pdv_id, sku_produto, synced_at DESC);
-CREATE INDEX IF NOT EXISTS idx_stock_reconciliation_items_status ON stock_reconciliation_items(integration_id, status, difference_type);
 
 CREATE TABLE IF NOT EXISTS devolucoes_avaria (
   id SERIAL PRIMARY KEY,
@@ -763,52 +473,259 @@ CREATE INDEX IF NOT EXISTS idx_omie_jobs_status ON omie_jobs(status, created_at 
 CREATE INDEX IF NOT EXISTS idx_omie_jobs_entity ON omie_jobs(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_omie_jobs_product ON omie_jobs(product_sku);
 
-CREATE TABLE IF NOT EXISTS user_order_alert_preferences (
-  id BIGSERIAL PRIMARY KEY,
-  user_key TEXT NOT NULL UNIQUE,
-  enabled BOOLEAN NOT NULL DEFAULT TRUE,
-  sound_id VARCHAR(100) NOT NULL DEFAULT 'repetitive-alert',
-  volume INTEGER NOT NULL DEFAULT 70,
-  visual_notifications BOOLEAN NOT NULL DEFAULT TRUE,
-  repeat_mode VARCHAR(40) NOT NULL DEFAULT 'three_times',
-  repeat_interval_seconds INTEGER NOT NULL DEFAULT 5,
-  stop_on_view BOOLEAN NOT NULL DEFAULT TRUE,
-  stop_on_service_start BOOLEAN NOT NULL DEFAULT TRUE,
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+ALTER TABLE produtos ADD COLUMN IF NOT EXISTS saldo_omie NUMERIC DEFAULT 0;
+ALTER TABLE produtos ADD COLUMN IF NOT EXISTS quantidade_reservada_acpark NUMERIC DEFAULT 0;
+ALTER TABLE produtos ADD COLUMN IF NOT EXISTS saldo_disponivel_acpark NUMERIC DEFAULT 0;
+ALTER TABLE produtos ADD COLUMN IF NOT EXISTS ultima_sincronizacao TIMESTAMP;
+ALTER TABLE produtos ADD COLUMN IF NOT EXISTS sincronizacao_status TEXT DEFAULT 'Manual';
+ALTER TABLE produtos ADD COLUMN IF NOT EXISTS stock_mode TEXT NOT NULL DEFAULT 'MANUAL';
+
+CREATE TABLE IF NOT EXISTS integrations (
+  id SERIAL PRIMARY KEY,
+  nome TEXT NOT NULL,
+  provedor TEXT NOT NULL,
+  tipo TEXT NOT NULL DEFAULT 'ERP_ESTOQUE',
+  ambiente TEXT NOT NULL DEFAULT 'PRODUCAO',
+  url_base TEXT,
+  ativo BOOLEAN NOT NULL DEFAULT FALSE,
+  status TEXT NOT NULL DEFAULT 'PENDENTE',
+  stock_mode TEXT NOT NULL DEFAULT 'MANUAL',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (provedor, ambiente)
 );
 
-ALTER TABLE user_order_alert_preferences ADD COLUMN IF NOT EXISTS repeat_mode VARCHAR(40) NOT NULL DEFAULT 'three_times';
-ALTER TABLE user_order_alert_preferences ADD COLUMN IF NOT EXISTS repeat_interval_seconds INTEGER NOT NULL DEFAULT 5;
-ALTER TABLE user_order_alert_preferences ADD COLUMN IF NOT EXISTS stop_on_view BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE user_order_alert_preferences ADD COLUMN IF NOT EXISTS stop_on_service_start BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'ERP_ESTOQUE';
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS ambiente TEXT NOT NULL DEFAULT 'PRODUCAO';
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS url_base TEXT;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS ativo BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'PENDENTE';
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS stock_mode TEXT NOT NULL DEFAULT 'MANUAL';
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS empresa_vinculada TEXT;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS last_connection_test_at TIMESTAMP;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS last_connection_duration_ms INTEGER;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
-CREATE TABLE IF NOT EXISTS order_alert_sounds (
-  id BIGSERIAL PRIMARY KEY,
-  sound_key VARCHAR(100) NOT NULL UNIQUE,
-  display_name VARCHAR(150) NOT NULL,
-  storage_path VARCHAR(500),
-  mime_type VARCHAR(100),
-  size_bytes BIGINT DEFAULT 0,
-  duration_seconds NUMERIC,
-  is_system BOOLEAN NOT NULL DEFAULT FALSE,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_by TEXT,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS integration_credentials (
+  id SERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE CASCADE,
+  credential_key TEXT NOT NULL,
+  encrypted_value TEXT NOT NULL,
+  masked_value TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (integration_id, credential_key)
 );
 
-INSERT INTO order_alert_sounds (sound_key, display_name, is_system, is_active)
-VALUES
-  ('default', 'Alerta padrão', TRUE, TRUE),
-  ('bell', 'Campainha curta', TRUE, TRUE),
-  ('soft', 'Toque suave', TRUE, TRUE),
-  ('chime', 'Chime', TRUE, TRUE),
-  ('double', 'Toque duplo', TRUE, TRUE),
-  ('repetitive-alert', 'Alerta repetitivo', TRUE, TRUE),
-  ('repetitive-bell', 'Campainha repetitiva', TRUE, TRUE),
-  ('urgent', 'Chamada urgente', TRUE, TRUE),
-  ('waiting', 'Pedido aguardando', TRUE, TRUE),
-  ('soft-continuous', 'Alerta contínuo suave', TRUE, TRUE)
-ON CONFLICT (sound_key) DO UPDATE
-SET display_name = EXCLUDED.display_name,
-    is_system = TRUE,
-    is_active = TRUE;
+ALTER TABLE integration_credentials ADD COLUMN IF NOT EXISTS integration_id INTEGER REFERENCES integrations(id) ON DELETE CASCADE;
+ALTER TABLE integration_credentials ADD COLUMN IF NOT EXISTS credential_key TEXT;
+ALTER TABLE integration_credentials ADD COLUMN IF NOT EXISTS encrypted_value TEXT;
+ALTER TABLE integration_credentials ADD COLUMN IF NOT EXISTS masked_value TEXT;
+ALTER TABLE integration_credentials ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE integration_credentials ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS integration_jobs (
+  id BIGSERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE CASCADE,
+  job_type TEXT NOT NULL,
+  payload JSONB DEFAULT '{}'::jsonb,
+  priority TEXT NOT NULL DEFAULT 'NORMAL',
+  priority_rank INTEGER NOT NULL DEFAULT 50,
+  status TEXT NOT NULL DEFAULT 'PENDENTE',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  scheduled_for TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  started_at TIMESTAMP,
+  completed_at TIMESTAMP,
+  last_error TEXT,
+  result JSONB,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'NORMAL';
+ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS priority_rank INTEGER NOT NULL DEFAULT 50;
+ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP;
+ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP;
+ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS result JSONB;
+ALTER TABLE integration_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS integration_attempts (
+  id BIGSERIAL PRIMARY KEY,
+  job_id BIGINT REFERENCES integration_jobs(id) ON DELETE CASCADE,
+  status TEXT NOT NULL,
+  request_payload JSONB,
+  response_payload JSONB,
+  error_message TEXT,
+  duration_ms INTEGER,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS integration_webhooks (
+  id BIGSERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE SET NULL,
+  provider_event_id TEXT,
+  event_type TEXT,
+  payload JSONB,
+  processed BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS product_integration_mappings (
+  id SERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE CASCADE,
+  sku_acpark TEXT REFERENCES produtos(sku) ON DELETE CASCADE,
+  external_product_id TEXT NOT NULL,
+  external_code TEXT,
+  active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (integration_id, sku_acpark)
+);
+
+CREATE TABLE IF NOT EXISTS pdv_stock_location_mappings (
+  id SERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE CASCADE,
+  pdv_acpark_id INTEGER REFERENCES pdvs(id) ON DELETE CASCADE,
+  omie_location_id TEXT NOT NULL,
+  omie_location_name TEXT,
+  active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (integration_id, pdv_acpark_id)
+);
+
+CREATE TABLE IF NOT EXISTS stock_movements (
+  id BIGSERIAL PRIMARY KEY,
+  document_type TEXT NOT NULL,
+  document_id BIGINT,
+  movement_type TEXT NOT NULL,
+  origin_location TEXT,
+  destination_location TEXT,
+  user_name TEXT,
+  idempotency_key TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS stock_movement_items (
+  id BIGSERIAL PRIMARY KEY,
+  movement_id BIGINT REFERENCES stock_movements(id) ON DELETE CASCADE,
+  sku_produto TEXT REFERENCES produtos(sku) ON DELETE SET NULL,
+  saldo_anterior NUMERIC,
+  quantidade NUMERIC NOT NULL,
+  saldo_posterior NUMERIC,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS stock_snapshots (
+  id BIGSERIAL PRIMARY KEY,
+  sku_produto TEXT REFERENCES produtos(sku) ON DELETE CASCADE,
+  pdv_id INTEGER REFERENCES pdvs(id) ON DELETE CASCADE,
+  saldo_local NUMERIC DEFAULT 0,
+  saldo_omie NUMERIC DEFAULT 0,
+  quantidade_reservada_acpark NUMERIC DEFAULT 0,
+  saldo_disponivel_acpark NUMERIC DEFAULT 0,
+  snapshot_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS sku_produto TEXT REFERENCES produtos(sku) ON DELETE CASCADE;
+ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS pdv_id INTEGER REFERENCES pdvs(id) ON DELETE CASCADE;
+ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS saldo_local NUMERIC DEFAULT 0;
+ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS saldo_omie NUMERIC DEFAULT 0;
+ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS quantidade_reservada_acpark NUMERIC DEFAULT 0;
+ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS saldo_disponivel_acpark NUMERIC DEFAULT 0;
+ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS snapshot_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS omie_stock_locations (
+  id SERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE CASCADE,
+  external_id TEXT NOT NULL,
+  name TEXT,
+  active BOOLEAN DEFAULT TRUE,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (integration_id, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS stock_reconciliations (
+  id BIGSERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'PENDENTE',
+  started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  completed_at TIMESTAMP,
+  created_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS stock_reconciliation_items (
+  id BIGSERIAL PRIMARY KEY,
+  reconciliation_id BIGINT REFERENCES stock_reconciliations(id) ON DELETE CASCADE,
+  sku_produto TEXT REFERENCES produtos(sku) ON DELETE SET NULL,
+  saldo_local NUMERIC DEFAULT 0,
+  saldo_omie NUMERIC DEFAULT 0,
+  diferenca NUMERIC DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'PENDENTE',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE stock_reconciliation_items ADD COLUMN IF NOT EXISTS reconciliation_id BIGINT REFERENCES stock_reconciliations(id) ON DELETE CASCADE;
+ALTER TABLE stock_reconciliation_items ADD COLUMN IF NOT EXISTS sku_produto TEXT REFERENCES produtos(sku) ON DELETE SET NULL;
+ALTER TABLE stock_reconciliation_items ADD COLUMN IF NOT EXISTS saldo_local NUMERIC DEFAULT 0;
+ALTER TABLE stock_reconciliation_items ADD COLUMN IF NOT EXISTS saldo_omie NUMERIC DEFAULT 0;
+ALTER TABLE stock_reconciliation_items ADD COLUMN IF NOT EXISTS diferenca NUMERIC DEFAULT 0;
+ALTER TABLE stock_reconciliation_items ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'PENDENTE';
+ALTER TABLE stock_reconciliation_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS integration_sync_state (
+  id SERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE CASCADE,
+  scope TEXT NOT NULL,
+  last_cursor TEXT,
+  last_success_at TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (integration_id, scope)
+);
+
+CREATE TABLE IF NOT EXISTS integration_runtime_state (
+  id SERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE CASCADE,
+  circuit_state TEXT NOT NULL DEFAULT 'CLOSED',
+  opened_at TIMESTAMP,
+  reset_at TIMESTAMP,
+  last_error TEXT,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (integration_id)
+);
+
+CREATE TABLE IF NOT EXISTS integration_metrics (
+  id BIGSERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE SET NULL,
+  metric_name TEXT NOT NULL,
+  metric_value NUMERIC NOT NULL,
+  labels JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS product_sync_temperature (
+  sku_produto TEXT PRIMARY KEY REFERENCES produtos(sku) ON DELETE CASCADE,
+  temperature TEXT NOT NULL DEFAULT 'FRIO',
+  last_requested_at TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS integration_audit_logs (
+  id BIGSERIAL PRIMARY KEY,
+  integration_id INTEGER REFERENCES integrations(id) ON DELETE SET NULL,
+  user_name TEXT,
+  action TEXT NOT NULL,
+  entity_type TEXT,
+  entity_id TEXT,
+  details JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_integration_jobs_status ON integration_jobs(status, priority_rank DESC, created_at);
+CREATE INDEX IF NOT EXISTS idx_integration_jobs_type ON integration_jobs(job_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stock_snapshots_sku ON stock_snapshots(sku_produto, snapshot_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stock_reconciliation_items_status ON stock_reconciliation_items(status, created_at DESC);

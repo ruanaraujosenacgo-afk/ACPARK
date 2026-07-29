@@ -8,6 +8,6 @@ export const state = {
   config: {},
   cart: [],
   orderIdempotencyKey: null,
-  currentView: null,
-  orderAlertPendingCount: 0
+  orderAlertPendingCount: 0,
+  currentView: null
 };

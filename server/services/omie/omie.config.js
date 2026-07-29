@@ -10,9 +10,9 @@ export function getOmieConfig(env = process.env) {
   const enabled = String(env.OMIE_ENABLED || "false").toLowerCase() === "true";
   const baseUrl = env.OMIE_BASE_URL || "https://app.omie.com.br/api/v1";
   const timeoutMs = Number(env.OMIE_TIMEOUT_MS || 15000);
-  const appKey = "";
-  const appSecret = "";
-  const configured = false;
+  const appKey = env.OMIE_APP_KEY || "";
+  const appSecret = env.OMIE_APP_SECRET || "";
+  const configured = enabled && Boolean(appKey && appSecret && baseUrl);
 
   return {
     enabled,

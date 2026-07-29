@@ -19,9 +19,10 @@ test("release screen saves draft and releases only entered quantities", () => {
   assert.match(app, /Salvar rascunho/);
   assert.match(app, /Enviar para retirada/);
   assert.match(app, /data-release-mode="entered-only"/);
-  assert.match(app, /Liberar para retirada<\/button>/);
   assert.match(app, /release_mode: releaseMode/);
   assert.doesNotMatch(app, /Liberar completo/);
+  assert.doesNotMatch(app, /Liberar parcial/);
+  assert.doesNotMatch(app, /Liberação Parcial/);
 });
 
 test("deleting products preserves draft values for remaining items", () => {
@@ -30,11 +31,10 @@ test("deleting products preserves draft values for remaining items", () => {
   assert.match(app, /removeReleaseDraftItems\(card\.dataset\.order, \[itemId\]\)/);
 });
 
-test("partial release pending items can be selected even when input is prefilled", () => {
+test("release pending items can be selected even when input is prefilled", () => {
   assert.match(app, /const savedReleaseQty = Number\(o\.quantidade_liberada \|\| 0\)/);
-  assert.match(app, /first\.status === "Libera/);
-  assert.match(app, /savedReleaseQty > 0/);
-  assert.match(app, /canBulkDeleteItem = canRemoveProducts[\s\S]*savedReleaseQty > 0/);
+  assert.match(app, /const canBulkDeleteItem = canRemoveProducts/);
+  assert.doesNotMatch(app, /canBulkDeleteItem = canRemoveProducts[\s\S]*savedReleaseQty > 0/);
 });
 
 test("bulk delete uses system modal with product details", () => {
@@ -46,18 +46,18 @@ test("bulk delete uses system modal with product details", () => {
   assert.doesNotMatch(app, /confirm\(`Deseja excluir/);
 });
 
-test("delete order button preserves withdrawal items from partial release tab", () => {
-  assert.match(app, /Excluir somente a parte pendente/);
-  assert.match(app, /confirmLabel: isPartialDelete/);
+test("delete order button no longer has partial release mode", () => {
+  assert.doesNotMatch(app, /Excluir somente a parte pendente/);
+  assert.doesNotMatch(app, /confirmLabel: isPartialDelete/);
   assert.doesNotMatch(app, /full_delete: true/);
-  assert.match(routes, /const fullDelete = body\.full_delete === true && deleteStatus !==/);
-  assert.match(routes, /deleteStatus === "Libera[\s\S]*&& !fullDelete/);
+  assert.doesNotMatch(routes, /const fullDelete = body\.full_delete/);
+  assert.doesNotMatch(routes, /deleteStatus === "Libera[\s\S]*&& !fullDelete/);
 });
 
-test("bulk delete route validates status, version and partial movement", () => {
+test("bulk delete route validates status and version", () => {
   assert.match(routes, /url\.pathname === "\/api\/admin\/order-items"/);
   assert.match(routes, /Produtos s/);
-  assert.match(routes, /produto j/);
+  assert.doesNotMatch(routes, /produto j[\s\S]{0,160}Libera/);
   assert.match(routes, /Conflito de edi/);
   assert.match(routes, /FOR UPDATE/);
 });
@@ -73,9 +73,9 @@ test("order flow supports entered-only release mode without automatic completion
 test("entered-only release does not create automatic partial remainder on withdrawal", () => {
   assert.match(routes, /release_mode/);
   assert.doesNotMatch(routes, /quantidade_solicitada = CASE WHEN \$6 = 'entered-only'/);
-  assert.match(routes, /COALESCE\(release_mode, ''\) <> 'entered-only'/);
-  assert.match(routes, /const suppressRemainder = row\.release_mode === "entered-only"/);
-  assert.match(routes, /missingQty > 0 && !hasSeparateRemainder && !suppressRemainder/);
+  assert.doesNotMatch(routes, /const suppressRemainder = row\.release_mode === "entered-only"/);
+  assert.doesNotMatch(routes, /missingQty > 0 && !hasSeparateRemainder && !suppressRemainder/);
+  assert.doesNotMatch(routes, /VALUES \(\$1, \$2, \$3, \$4, \$5, 0, 'Libera/);
 });
 
 test("returning an order to in progress regroups all split status items", () => {
@@ -85,7 +85,7 @@ test("returning an order to in progress regroups all split status items", () => 
   assert.match(routes, /DELETE FROM pedidos WHERE id = ANY\(\$1::int\[\]\)/);
 });
 
-test("moving partial release to withdrawal merges existing pending withdrawal item", () => {
+test("moving release to withdrawal merges existing pending withdrawal item", () => {
   assert.match(routes, /itemStatus === "Aguardando Retirada"/);
   assert.match(routes, /AND sku_produto = \$2[\s\S]*AND status = 'Aguardando Retirada'[\s\S]*AND id <> \$3/);
   assert.match(routes, /quantidade_liberada = COALESCE\(quantidade_liberada, 0\) \+ \$2/);
@@ -98,20 +98,17 @@ test("bulk delete styles keep controls usable on release table", () => {
   assert.match(styles, /\.system-confirm-details/);
 });
 
-test("release partial status is accepted by server actions", () => {
-  assert.match(service, /orderStatuses = \["Pendente", "Em Andamento", "Aguardando Retirada"/);
-  assert.match(service, /status === "Liberado Parcial"/);
+test("release partial status is no longer offered as a server action", () => {
+  assert.match(service, /orderStatuses = \["Pendente", "Em Andamento", "Aguardando Retirada", "Finalizado"\]/);
   assert.match(service, /normalizeOrderStatus\(status\)/);
-  assert.match(routes, /const deleteStatus = orderStatuses\.includes\(body\.status\) \? body\.status : ""/);
+  assert.doesNotMatch(service, /orderStatuses = \["Pendente", "Em Andamento", "Aguardando Retirada", "Libera/);
+  assert.doesNotMatch(routes, /const deleteStatus = orderStatuses\.includes\(body\.status\) \? body\.status : ""/);
   assert.match(routes, /const requestStatus = orderStatuses\.includes\(body\.status\) \? body\.status : ""/);
-  assert.match(routes, /status IN \('Libera/);
-  assert.match(routes, /Liberado Parcial/);
+  assert.doesNotMatch(routes, /nextStatus === "Libera/);
 });
 
-test("partial order delete keeps released withdrawal rows intact", () => {
-  assert.match(routes, /const fullDelete = body\.full_delete === true && deleteStatus !==/);
-  assert.match(routes, /if \(deleteStatus === "Libera[\s\S]*&& !fullDelete\)/);
-  assert.match(routes, /SET quantidade_solicitada = quantidade_liberada/);
-  assert.match(routes, /AND status = 'Aguardando Retirada'/);
-  assert.match(routes, /COALESCE\(quantidade_liberada, 0\) <= 0/);
+test("partial order delete path was removed", () => {
+  assert.doesNotMatch(routes, /if \(deleteStatus === "Libera[\s\S]*&& !fullDelete\)/);
+  assert.doesNotMatch(routes, /COALESCE\(quantidade_liberada, 0\) <= 0/);
+  assert.match(routes, /DELETE FROM pedidos WHERE codigo_pedido = \$1 RETURNING id/);
 });

@@ -11,3 +11,7 @@ __pycache__/
 .storage/
 .codex-temp/
 .local-app-logs/
+test-results/
+playwright-report/
+
+.env*

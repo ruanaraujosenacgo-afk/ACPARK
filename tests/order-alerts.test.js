@@ -88,6 +88,13 @@ test("new order visual alert stays fixed until viewed or silenced", () => {
   assert.doesNotMatch(alertsSource, /setTimeout\(\(\) => node\.remove/);
 });
 
+test("warehouse devices rebuild visual alerts from current pending orders", () => {
+  assert.match(alertsSource, /function showPendingSnapshotAlerts/);
+  assert.match(alertsSource, /showPendingSnapshotAlerts\(snapshot\)/);
+  assert.match(alertsSource, /eventId = order\.eventId \|\| `pending:\$\{orderId\}`/);
+  assert.match(alertsSource, /showOrderToast\(\{ \.\.\.order, eventId \}\)/);
+});
+
 test("viewing an order alert focuses the release order card", () => {
   assert.match(alertsSource, /acparkFocusReleaseOrder/);
   assert.match(appSource, /focusReleaseOrderFromAlert/);

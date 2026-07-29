@@ -4,6 +4,9 @@ import { Readable } from "node:stream";
 import { handleEstoqueRoutes } from "../server/modules/estoque/estoque.routes.js";
 import { handlePedidosRoutes } from "../server/modules/pedidos/pedidos.routes.js";
 import { handleAvariasRoutes } from "../server/modules/avarias/avarias.routes.js";
+import fs from "node:fs";
+
+const pedidosRoutesSource = fs.readFileSync("server/modules/pedidos/pedidos.routes.js", "utf8");
 
 function createResponse() {
   return {
@@ -113,4 +116,9 @@ test("pdv order creation requires idempotency key before touching data", async (
   assert.equal(handled, true);
   assert.equal(res.status, 400);
   assert.deepEqual(JSON.parse(res.body), { error: "Identificador da operação ausente. Atualize a página e tente novamente." });
+});
+
+test("pdv order quantity is not capped by maximum stock", () => {
+  assert.doesNotMatch(pedidosRoutesSource, /Pedido acima do estoque maximo/);
+  assert.doesNotMatch(pedidosRoutesSource, /current \+ qty > max/);
 });

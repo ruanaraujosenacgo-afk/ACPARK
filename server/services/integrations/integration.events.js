@@ -1,29 +1,24 @@
 const clients = new Set();
 
-export function publishIntegrationEvent(type, payload = {}) {
-  const event = {
-    type,
-    payload,
-    created_at: new Date().toISOString()
-  };
-  const text = `event: ${type}\ndata: ${JSON.stringify(event)}\n\n`;
+export function publishIntegrationEvent(event, payload = {}) {
+  const data = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const res of clients) {
     try {
-      res.write(text);
+      res.write(data);
     } catch {
       clients.delete(res);
     }
   }
-  return event;
 }
 
 export function handleIntegrationEvents(req, res) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive"
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
   });
-  res.write(`event: integration.connected\ndata: ${JSON.stringify({ ok: true, created_at: new Date().toISOString() })}\n\n`);
+  res.write(`event: ready\ndata: ${JSON.stringify({ ok: true })}\n\n`);
   clients.add(res);
   req.on("close", () => clients.delete(res));
 }

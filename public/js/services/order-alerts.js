@@ -173,10 +173,9 @@ function markAlertStopped(orderId, eventId, reason) {
   const set = reason === "VIEWED" ? viewedAlertIds : silencedAlertIds;
   rememberListValue(key, set, orderId);
   rememberListValue(key, set, eventId);
-  stopCurrentOrderAlert(orderId);
+  stopAllOrderAlerts();
   removeAlertCard(orderId);
   broadcast?.postMessage({ type: "ORDER_ALERT_STOPPED", orderId, eventId, reason });
-  console.debug("Alerta interrompido", { orderId, reason });
 }
 
 function openReleaseAndStop(orderId, eventId, button = null) {
@@ -184,10 +183,9 @@ function openReleaseAndStop(orderId, eventId, button = null) {
     button.disabled = true;
     button.textContent = "Abrindo pedido...";
   }
-  if (preferences.stopOnView) stopCurrentOrderAlert(orderId);
+  stopAllOrderAlerts();
   markAlertStopped(orderId, eventId, "VIEWED");
   sessionStorage.setItem(focusOrderKey, String(orderId));
-  console.debug("Abrindo pedido pelo alerta", { orderId, currentPage: state.currentView });
   routeCallback?.("release");
 }
 
@@ -241,6 +239,17 @@ function showOrderToast(event) {
     savedAt: Date.now()
   });
   persistActiveAlerts();
+}
+
+function showPendingSnapshotAlerts(snapshot = {}) {
+  if (!preferences.visualNotifications || state.user?.role !== "admin") return;
+  const orders = Array.isArray(snapshot.orders) ? snapshot.orders : [];
+  for (const order of orders) {
+    const orderId = orderIdFromEvent(order);
+    const eventId = order.eventId || `pending:${orderId}`;
+    if (!orderId || !snapshot.ids?.has(orderId) || isDismissed(orderId, eventId)) continue;
+    showOrderToast({ ...order, eventId });
+  }
 }
 
 async function fetchPendingSnapshot() {
@@ -298,7 +307,6 @@ async function handleNewOrderEvent(event) {
   const orderId = orderIdFromEvent(event);
   const eventId = event.eventId || `${event.orderNumber || ""}:${event.createdAt || ""}`;
   if (!eventId || notifiedEventIds.has(eventId) || isDismissed(orderId, eventId)) return;
-  console.debug("Alerta de pedido recebido", { eventId, orderId, orderNumber: event.orderNumber });
   rememberEvent(eventId);
   broadcast?.postMessage({ type: "order-alert-processed", eventId });
   showOrderToast(event);
@@ -320,6 +328,7 @@ async function startFallbackPolling() {
     lastPendingBaseline = snapshot.count;
     lastPendingIds = snapshot.ids;
     state.orderAlertPendingCount = snapshot.count;
+    showPendingSnapshotAlerts(snapshot);
   } catch {
     lastPendingBaseline = 0;
     lastPendingIds = new Set();
@@ -328,6 +337,7 @@ async function startFallbackPolling() {
     if (state.user?.role !== "admin") return;
     try {
       const snapshot = await fetchPendingSnapshot();
+      showPendingSnapshotAlerts(snapshot);
       const newOrders = snapshot.orders.filter((item) => {
         const orderId = String(item.orderId || item.orderNumber || "");
         return orderId && !lastPendingIds.has(orderId);
@@ -376,6 +386,7 @@ export async function startOrderAlerts(options = {}) {
   if (snapshot) {
     lastPendingBaseline = snapshot.count;
     lastPendingIds = snapshot.ids;
+    showPendingSnapshotAlerts(snapshot);
   }
   if (eventSource) return;
   if (!window.EventSource) {
@@ -415,7 +426,7 @@ broadcast?.addEventListener("message", (event) => {
     rememberEvent(event.data.eventId);
   }
   if (event.data?.type === "order-alert-silenced") {
-    stopCurrentOrderAlert(event.data.orderId || null);
+    stopAllOrderAlerts();
   }
   if (event.data?.type === "ORDER_ALERT_STOPPED") {
     const reason = event.data.reason === "VIEWED" ? "VIEWED" : "SILENCED";
@@ -423,7 +434,7 @@ broadcast?.addEventListener("message", (event) => {
     const set = reason === "VIEWED" ? viewedAlertIds : silencedAlertIds;
     rememberListValue(key, set, event.data.orderId);
     rememberListValue(key, set, event.data.eventId);
-    stopCurrentOrderAlert(event.data.orderId || null);
+    stopAllOrderAlerts();
     removeAlertCard(event.data.orderId);
   }
 });

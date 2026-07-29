@@ -82,7 +82,7 @@ function shell(content, actions = "") {
           <strong>${esc(displayName)}</strong>
         </div>
         <div class="side-menu-list">
-          ${items.map(([id, label]) => `<button class="side-link nav-btn" data-view="${id}">${label}${id === "release" ? ` <span class="nav-count ${state.orderAlertPendingCount ? "" : "hidden"}" data-global-release-count>${state.orderAlertPendingCount || 0}</span>` : ""}</button>`).join("")}
+          ${items.map(([id, label]) => `<button class="side-link nav-btn" data-view="${id}">${label}</button>`).join("")}
         </div>
         <button class="btn danger side-logout" id="logout">Sair</button>
       </aside>
@@ -160,12 +160,11 @@ async function loadBootstrap() {
 }
 
 
-const orderStatuses = ["Pendente", "Em Andamento", "Aguardando Retirada", "Liberação Parcial", "Finalizado"];
+const orderStatuses = ["Pendente", "Em Andamento", "Aguardando Retirada", "Finalizado"];
 const orderStatusLabels = {
   Pendente: "Pendentes",
   "Em Andamento": "Em andamento",
   "Aguardando Retirada": "Aguardando Retirada",
-  "Liberação Parcial": "Liberação Parcial",
   Finalizado: "Finalizado"
 };
 
@@ -197,7 +196,7 @@ function orderStatusTimestamp(row = {}) {
   const status = row.status || "";
   const value = status === "Em Andamento"
     ? row.em_andamento_em || row.criado_em || row.data_hora
-    : ["Aguardando Retirada", "Liberação Parcial"].includes(status)
+    : status === "Aguardando Retirada"
       ? row.pronto_retirada_em || row.liberado_em || row.criado_em || row.data_hora
       : status === "Finalizado"
         ? row.retirada_em || row.pronto_retirada_em || row.liberado_em || row.criado_em || row.data_hora
@@ -215,10 +214,6 @@ function sortOrderGroupsNewest(groups = []) {
 }
 
 function orderDisplayItemsForStatus(group = []) {
-  const status = group[0]?.status || "";
-  if (status === "Liberação Parcial") {
-    return group.filter((item) => Number(item.quantidade_liberada || 0) <= 0);
-  }
   return group;
 }
 
@@ -359,8 +354,13 @@ async function route(view) {
 
 async function viewOrder(options = {}) {
   const data = await request("/api/pdv/products", { silentLoading: Boolean(options.auto) });
-  const draftPayload = await request("/api/pdv/order-draft", { silentLoading: true }).catch(() => ({ draft: null }));
+  const draftPayload = options.skipDraftRestore
+    ? { draft: null }
+    : await request("/api/pdv/order-draft", { silentLoading: true }).catch(() => ({ draft: null }));
   const savedDraft = draftPayload?.draft || null;
+  const savedRequester = savedDraft?.solicitante && savedDraft.solicitante !== state.user?.name
+    ? savedDraft.solicitante
+    : "";
   if (!state.cart.length && savedDraft?.items?.length) {
     state.cart = savedDraft.items
       .map((item) => ({
@@ -388,7 +388,7 @@ async function viewOrder(options = {}) {
         <div class="order-top-grid">
           <div class="order-form-area">
             <div class="order-info-grid">
-              <label class="grid gap-1 text-sm font-bold">Solicitante <input name="solicitante" id="solicitante" required value="${esc(savedDraft?.solicitante || "")}" /></label>
+              <label class="grid gap-1 text-sm font-bold">Solicitante <input name="solicitante" id="solicitante" required value="${esc(savedRequester)}" placeholder="Informe o nome do responsável" /></label>
               <label class="grid gap-1 text-sm font-bold">Observação <textarea name="observacao" id="observacao" rows="3">${esc(savedDraft?.observacao || "")}</textarea></label>
             </div>
 
@@ -459,6 +459,82 @@ async function viewOrder(options = {}) {
     observacao: document.querySelector("#observacao")?.value || "",
     items: state.cart.map((item) => ({ ...item }))
   });
+  const clearStoredOrderDrafts = () => {
+    const userKeys = [
+      state.user?.id,
+      state.user?.pdvId,
+      state.user?.name
+    ].filter(Boolean).map(String);
+    const fixedKeys = new Set([
+      "pdvOrderDraft",
+      "pedidoDraft",
+      "orderDraft",
+      "pdv:orderDraft",
+      "acparkOrderDraft",
+      ...userKeys.map((key) => `pdvOrderDraft:${key}`),
+      ...userKeys.map((key) => `pedidoDraft:${key}`),
+      ...userKeys.map((key) => `orderDraft:${key}`)
+    ]);
+    [localStorage, sessionStorage].forEach((storage) => {
+      for (const key of fixedKeys) storage.removeItem(key);
+      for (let index = storage.length - 1; index >= 0; index -= 1) {
+        const key = storage.key(index);
+        if (/pedido.*draft|draft.*pedido|order.*draft|draft.*order|rascunho/i.test(key || "")) {
+          storage.removeItem(key);
+        }
+      }
+    });
+  };
+  const limparRascunhoPedido = () => {
+    const requester = "";
+    const productSearchField = document.querySelector("#order-product-search");
+    const productSkuField = document.querySelector("#order-product-sku");
+    const quantityField = document.querySelector("#order-product-quantity");
+    const suggestions = document.querySelector("#order-product-suggestions");
+    const observationField = document.querySelector("#observacao");
+    const requesterField = document.querySelector("#solicitante");
+    state.cart = [];
+    state.orderIdempotencyKey = null;
+    if (observationField) observationField.value = "";
+    if (productSearchField) {
+      productSearchField.value = "";
+      productSearchField.dataset.selectedLabel = "";
+    }
+    if (productSkuField) productSkuField.value = "";
+    if (quantityField) quantityField.value = 1;
+    suggestions?.classList.add("hidden");
+    if (requesterField) requesterField.value = requester;
+    clearStoredOrderDrafts();
+    renderCart();
+  };
+  const handleClearOrderDraft = async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const button = event.currentTarget;
+    if (button.disabled) return;
+    const confirmed = await confirmSystem({
+      title: "Limpar rascunho?",
+      message: "Todos os produtos, quantidades e observações deste rascunho serão removidos.",
+      confirmLabel: "Limpar rascunho",
+      danger: true
+    });
+    if (!confirmed) return;
+    const previousText = button.textContent;
+    button.disabled = true;
+    button.textContent = "Limpando rascunho...";
+    try {
+      limparRascunhoPedido();
+      await request("/api/pdv/order-draft", { method: "DELETE" });
+      toast("Rascunho removido com sucesso.");
+      await viewOrder({ skipDraftRestore: true });
+    } catch (error) {
+      toast(error.message || "Não foi possível limpar o rascunho.", "error");
+      limparRascunhoPedido();
+    } finally {
+      button.disabled = false;
+      button.textContent = previousText;
+    }
+  };
   const renderAvailableProducts = () => {
     document.querySelector("#available-products").innerHTML = data.products.length
       ? table(["SKU", "Produto", "Categoria", "Estoque central", "Atual", "Máx.", "Ação"], data.products.map((product) => `
@@ -497,6 +573,7 @@ async function viewOrder(options = {}) {
   };
   renderAvailableProducts();
   renderCart();
+  document.querySelector("#clear-order-draft").onclick = handleClearOrderDraft;
 
   const applyAvailableFilters = () => {
     const term = String(document.querySelector("#available-product-search")?.value || "").trim().toLowerCase();
@@ -569,32 +646,6 @@ async function viewOrder(options = {}) {
     }
   });
 
-  document.querySelector("#clear-order-draft").addEventListener("click", async (event) => {
-    const confirmed = await confirmSystem({
-      title: "Limpar rascunho",
-      message: "Deseja apagar o rascunho salvo deste pedido?",
-      consequence: "O carrinho atual também será limpo.",
-      confirmLabel: "Limpar rascunho",
-      danger: true
-    });
-    if (!confirmed) return;
-    const button = event.currentTarget;
-    const previousText = button.textContent;
-    button.disabled = true;
-    button.textContent = "Limpando...";
-    try {
-      await request("/api/pdv/order-draft", { method: "DELETE" });
-      state.cart = [];
-      renderCart();
-      toast("Rascunho limpo.");
-    } catch (error) {
-      toast(error.message || "Não foi possível limpar o rascunho.", "error");
-    } finally {
-      button.disabled = false;
-      button.textContent = previousText;
-    }
-  });
-
   document.querySelector("#send-order").addEventListener("click", async (event) => {
     const button = event.currentTarget;
     if (button.disabled) return;
@@ -652,7 +703,7 @@ async function viewMine(filters = {}) {
   const statuses = orderStatuses;
   const statusLabels = orderStatusLabels;
   const data = await request(`/api/pdv/orders?from=${from}&to=${to}`, { silentLoading: Boolean(filters.auto) });
-  const readyOrders = data.orders.filter((order) => ["Aguardando Retirada", "Liberação Parcial"].includes(order.status));
+  const readyOrders = data.orders.filter((order) => order.status === "Aguardando Retirada");
   const grouped = Object.values(data.orders.reduce((acc, row) => {
     const key = orderGroupKey(row);
     acc[key] ||= [];
@@ -819,14 +870,14 @@ function syncMineOrderList(visibleGroups, activeStatus) {
 function pdvOrderCard(group) {
   const first = group[0];
   const visibleItems = orderDisplayItemsForStatus(group);
-  const isWithdrawalStatus = ["Aguardando Retirada", "Liberação Parcial"].includes(first.status);
+  const isWithdrawalStatus = first.status === "Aguardando Retirada";
   const statusTime = first.status === "Pendente"
     ? `Pendente desde ${moneyDate(first.data_hora)}`
     : first.status === "Em Andamento"
-        ? `Em andamento desde ${moneyDate(first.em_andamento_em || first.data_hora)}`
-        : isWithdrawalStatus
-          ? `${first.status} desde ${moneyDate(first.pronto_retirada_em || first.liberado_em || first.data_hora)}`
-          : `Finalizado em ${moneyDate(first.retirada_em || first.liberado_em || first.data_hora)}`;
+      ? `Em andamento desde ${moneyDate(first.em_andamento_em || first.data_hora)}`
+      : isWithdrawalStatus
+        ? `${first.status} desde ${moneyDate(first.pronto_retirada_em || first.liberado_em || first.data_hora)}`
+        : `Finalizado em ${moneyDate(first.retirada_em || first.liberado_em || first.data_hora)}`;
   const orderItemsPayload = group.map((item) => ({
     id: item.id,
     version: item.version || 1,
@@ -847,9 +898,9 @@ function pdvOrderCard(group) {
     </button>
     <div class="order-accordion-body hidden">
       ${first.observacao ? `<p class="mb-3 rounded bg-amber-50 p-2 text-sm text-amber-900">${esc(first.observacao)}</p>` : ""}
-      ${isWithdrawalStatus ? `<div class="release-alert card"><strong>${first.status === "Liberação Parcial" ? "Pedido liberado parcialmente." : "Pedido pronto para retirada."}</strong><p>Compareça ao almoxarifado para conferência e assinatura no dispositivo do almoxarifado.</p></div>` : ""}
-      ${["Finalizado", "Liberação Parcial"].includes(first.status) && first.retirada_assinatura ? `<div class="order-card-actions no-print"><button class="btn secondary view-order-withdrawal" type="button" data-order="${esc(first.codigo_pedido)}" data-signature="${esc(first.retirada_assinatura)}" data-responsible="${esc(first.retirada_responsavel || "")}" data-date="${esc(first.retirada_em ? moneyDate(first.retirada_em) : "")}" data-user="${esc(first.retirada_usuario_almoxarifado || "")}" data-pdv="${esc(state.user?.name || "")}" data-items='${withdrawalItemsAttribute(orderReleasedItems(group))}'>Visualizar comprovante de retirada</button></div>` : ""}
-      ${["Aguardando Retirada", "Liberação Parcial", "Finalizado"].includes(first.status)
+      ${isWithdrawalStatus ? `<div class="release-alert card"><strong>Pedido pronto para retirada.</strong><p>Compareça ao almoxarifado para conferência e assinatura no dispositivo do almoxarifado.</p></div>` : ""}
+      ${first.status === "Finalizado" && first.retirada_assinatura ? `<div class="order-card-actions no-print"><button class="btn secondary view-order-withdrawal" type="button" data-order="${esc(first.codigo_pedido)}" data-signature="${esc(first.retirada_assinatura)}" data-responsible="${esc(first.retirada_responsavel || "")}" data-date="${esc(first.retirada_em ? moneyDate(first.retirada_em) : "")}" data-user="${esc(first.retirada_usuario_almoxarifado || "")}" data-pdv="${esc(state.user?.name || "")}" data-items='${withdrawalItemsAttribute(orderReleasedItems(group))}'>Visualizar comprovante de retirada</button></div>` : ""}
+      ${["Aguardando Retirada", "Finalizado"].includes(first.status)
         ? table(["Produto", "Estoque central", "Quantidade solicitada", "Quantidade liberada"], visibleItems.map((o) => `
         <tr>
           <td>${esc(o.produto)} ${o.item_origem === "ALMOX" ? `<span class="order-source-badge">Almox</span>` : ""}</td>
@@ -3339,7 +3390,7 @@ async function viewDamagesAdmin(filters = {}) {
   const showDamageMetrics = localStorage.getItem("damageMetricsOpen") === "true";
   shell(`
     <section class="release-screen">
-      <section class="card">
+      <section class="card history-filter-card">
         <form id="damage-admin-filter" class="filter-panel damage-admin-filter">
           <div class="filter-copy">
             <p class="eyebrow">Avarias</p>
@@ -4164,39 +4215,60 @@ async function viewOmieIntegrations(filters = {}) {
           <button class="icon-action close-integration-modal" type="button" aria-label="Fechar">&times;</button>
         </div>
         <input name="id" type="hidden" value="${esc(integration.id || "")}" />
-        <label class="grid gap-1 text-sm font-bold">Nome <input name="nome" value="${esc(integration.nome || "OMIE")}" required /></label>
-        <label class="grid gap-1 text-sm font-bold">Provedor
-          <select name="provedor">
-            <option value="OMIE" ${integration.provedor !== "OUTRA" ? "selected" : ""}>OMIE — ERP e estoque</option>
-            <option value="OUTRA" ${integration.provedor === "OUTRA" ? "selected" : ""}>OUTRA — Integração personalizada</option>
-          </select>
-        </label>
-        <label class="grid gap-1 text-sm font-bold">Ambiente
-          <select name="ambiente">
-            <option value="PRODUCAO" ${(integration.ambiente || "PRODUCAO") === "PRODUCAO" ? "selected" : ""}>Produção</option>
-            <option value="HOMOLOGACAO" ${integration.ambiente === "HOMOLOGACAO" ? "selected" : ""}>Homologação</option>
-          </select>
-        </label>
-        <label class="grid gap-1 text-sm font-bold">URL base <input name="url_base" value="${esc(integration.url_base || "https://app.omie.com.br/api/v1")}" /></label>
-        <label class="grid gap-1 text-sm font-bold">Empresa vinculada <input name="empresa_vinculada" value="${esc(integration.empresa_vinculada || "")}" /></label>
-        <label class="grid gap-1 text-sm font-bold">App key <input name="app_key" autocomplete="off" placeholder="${integration.id ? "Preencha apenas para alterar" : "App key"}" /></label>
-        <label class="grid gap-1 text-sm font-bold">App secret <input name="app_secret" type="password" autocomplete="new-password" placeholder="${integration.id ? "Preencha apenas para alterar" : "App secret"}" /></label>
-        <label class="grid gap-1 text-sm font-bold">Token <input name="token" type="password" autocomplete="new-password" placeholder="Opcional" /></label>
-        <label class="grid gap-1 text-sm font-bold">Webhook secret <input name="webhook_secret" type="password" autocomplete="new-password" placeholder="Opcional" /></label>
-        <label class="category-chip selected-chip"><input name="ativo" type="checkbox" value="true" ${integration.ativo !== false ? "checked" : ""} /><span>Integração ativa</span></label>
-        <div class="form-actions"><button class="btn secondary close-integration-modal" type="button">Cancelar</button><button class="btn" type="submit">Salvar integração</button></div>
+        <div class="integration-modal-body">
+          <label class="grid gap-1 text-sm font-bold">Nome <input name="nome" value="${esc(integration.nome || "OMIE")}" required /></label>
+          <label class="grid gap-1 text-sm font-bold">Provedor
+            <select name="provedor">
+              <option value="OMIE" ${integration.provedor !== "OUTRA" ? "selected" : ""}>OMIE — ERP e estoque</option>
+              <option value="OUTRA" ${integration.provedor === "OUTRA" ? "selected" : ""}>OUTRA — Integração personalizada</option>
+            </select>
+          </label>
+          <label class="grid gap-1 text-sm font-bold">Ambiente
+            <select name="ambiente">
+              <option value="PRODUCAO" ${(integration.ambiente || "PRODUCAO") === "PRODUCAO" ? "selected" : ""}>Produção</option>
+              <option value="HOMOLOGACAO" ${integration.ambiente === "HOMOLOGACAO" ? "selected" : ""}>Homologação</option>
+            </select>
+          </label>
+          <label class="grid gap-1 text-sm font-bold">URL base <input name="url_base" value="${esc(integration.url_base || "https://app.omie.com.br/api/v1")}" /></label>
+          <label class="grid gap-1 text-sm font-bold">Empresa vinculada <input name="empresa_vinculada" value="${esc(integration.empresa_vinculada || "")}" /></label>
+          <label class="grid gap-1 text-sm font-bold">App key <input name="app_key" autocomplete="off" placeholder="${integration.id ? "Preencha apenas para alterar" : "App key"}" /></label>
+          <label class="grid gap-1 text-sm font-bold">App secret <input name="app_secret" type="password" autocomplete="new-password" placeholder="${integration.id ? "Preencha apenas para alterar" : "App secret"}" /></label>
+          <label class="grid gap-1 text-sm font-bold">Token <input name="token" type="password" autocomplete="new-password" placeholder="Opcional" /></label>
+          <label class="grid gap-1 text-sm font-bold">Webhook secret <input name="webhook_secret" type="password" autocomplete="new-password" placeholder="Opcional" /></label>
+          <label class="category-chip selected-chip"><input name="ativo" type="checkbox" value="true" ${integration.ativo !== false ? "checked" : ""} /><span>Integração ativa</span></label>
+        </div>
+        <div class="form-actions integration-modal-actions"><button class="btn secondary close-integration-modal" type="button">Cancelar</button><button class="btn" type="submit">Salvar integração</button></div>
       </form>`;
     modal.querySelectorAll(".close-integration-modal").forEach((button) => button.addEventListener("click", close));
     modal.querySelector("#integration-form").addEventListener("submit", async (event) => {
       event.preventDefault();
+      const submitButton = event.currentTarget.querySelector('button[type="submit"]');
+      const originalLabel = submitButton?.textContent || "Salvar integração";
+      if (submitButton) {
+        submitButton.disabled = true;
+        submitButton.textContent = "Salvando...";
+      }
       const formData = new FormData(event.currentTarget);
       const form = Object.fromEntries(formData);
       form.ativo = formData.has("ativo");
       form.tipo = form.provedor === "OMIE" ? "ERP_ESTOQUE" : "PERSONALIZADA";
-      await request("/api/admin/integrations", { method: "POST", body: JSON.stringify(form) });
-      toast("Integração salva.");
-      close();
-      await viewOmieIntegrations({ status, type, from, to, entityId });
+      try {
+        await request("/api/admin/integrations", {
+          method: "POST",
+          body: JSON.stringify(form),
+          loadingMessage: "Salvando integração..."
+        });
+        toast("Integração salva.");
+        close();
+        await viewOmieIntegrations({ status, type, from, to, entityId });
+      } catch (error) {
+        toast(error.message || "Não foi possível salvar a integração.", "error");
+      } finally {
+        if (submitButton) {
+          submitButton.disabled = false;
+          submitButton.textContent = originalLabel;
+        }
+      }
     });
     modal.addEventListener("click", (event) => {
       if (event.target === modal) close();
@@ -4344,7 +4416,7 @@ async function viewDashboard(filters = {}) {
         </div>
         <div class="mt-4 grid gap-3">
           ${data.ranking.map((r) => `<button class="rank-item product-trend-btn ${ranking === "produto" && data.selectedProduct?.sku === r.sku ? "is-selected" : ""}" data-sku="${esc(r.sku || "")}" ${ranking === "pdv" ? "disabled" : ""}>
-            <div class="flex justify-between gap-3 text-sm font-bold"><span>${ranking === "pdv" ? esc(r.pdv) : `${esc(r.produto)} - ${esc(r.pdv)}`}</span><span>${r.total}</span></div>
+            <div class="flex justify-between gap-3 text-sm font-bold"><span>${ranking === "pdv" ? esc(r.pdv) : esc(r.produto)}</span><span>${r.total}</span></div>
             <div class="h-3 rounded-full bg-cyan-50"><div class="h-3 rounded-full bg-[color:var(--ac-orange)]" style="width:${(r.total / max) * 100}%"></div></div>
           </button>`).join("") || `<p class="text-sm text-slate-500">Nenhum pedido encontrado no período.</p>`}
         </div>
@@ -5434,11 +5506,6 @@ async function viewRelease(filters = {}) {
   let selectedPdvId = filters.pdvId || document.querySelector("#release-pdv-filter")?.value || "";
   let searchCode = filters.q || document.querySelector("#release-code-filter")?.value || "";
   let activeStatus = filters.status || document.querySelector(".release-tabs .config-tab.is-active")?.dataset.releaseStatus || "Pendente";
-  const focusOrderCode = !filters.auto ? (filters.focusOrder || sessionStorage.getItem("acparkFocusReleaseOrder") || "") : "";
-  if (focusOrderCode) {
-    activeStatus = "Pendente";
-  }
-  const focusRetry = Boolean(filters.focusRetry);
   if (from && to && from > to) {
     toast("A data inicial não pode ser posterior à data final.", "error");
     [from, to] = [to, from];
@@ -5556,7 +5623,7 @@ async function viewRelease(filters = {}) {
     await viewRelease({ from, to, pdvId: selectedPdvId, q: searchCode, status: activeStatus });
   });
   bindReleaseInteractions(from, to, activeStatus, document, selectedPdvId, searchCode);
-  focusReleaseOrderFromAlert(focusOrderCode, { focusRetry });
+  focusReleaseOrderFromAlert({ from, to, pdvId: selectedPdvId, q: searchCode, status: activeStatus, focusRetry: filters.focusRetry });
   startAutoRefresh("release", async () => {
     if (document.body.classList.contains("printing-receipt")) return;
     const currentStatus = document.querySelector(".release-tabs .config-tab.is-active")?.dataset.releaseStatus || activeStatus;
@@ -5566,44 +5633,26 @@ async function viewRelease(filters = {}) {
   }, 5000, { ignoreEditing: true });
 }
 
-async function focusReleaseOrderFromAlert(orderCode, context = {}) {
+async function focusReleaseOrderFromAlert(context = {}) {
+  const orderCode = sessionStorage.getItem("acparkFocusReleaseOrder");
   if (!orderCode) return;
-  const card = document.querySelector(`[data-order="${CSS.escape(String(orderCode))}"]`);
+  const card = document.querySelector(`[data-order="${CSS.escape(orderCode)}"]`);
   if (!card) {
-    if (context.focusRetry) {
-      sessionStorage.removeItem("acparkFocusReleaseOrder");
-      toast("Não foi possível localizar o pedido na lista de pendentes.", "error");
-      return;
-    }
-    const showAllPending = await confirmSystem({
+    if (context.focusRetry) return;
+    const showAll = await confirmSystem({
       title: "Pedido fora dos filtros",
       message: "Este pedido está fora dos filtros atuais.",
-      consequence: "Você pode visualizar todos os pedidos pendentes sem aplicar o código do pedido como filtro.",
-      confirmLabel: "Visualizar todos os pendentes",
-      cancelLabel: "Manter filtros"
+      consequence: "Você pode visualizar todos os pendentes sem aplicar o código do pedido como filtro.",
+      cancelLabel: "Manter filtros",
+      confirmLabel: "Visualizar todos os pendentes"
     });
-    if (!showAllPending) {
-      sessionStorage.removeItem("acparkFocusReleaseOrder");
-      return;
+    if (showAll) {
+      await viewRelease({ from: context.from, to: context.to, pdvId: "", q: "", status: "Pendente", focusRetry: true });
     }
-    await viewRelease({
-      from: weekAgo(),
-      to: today(),
-      pdvId: "",
-      q: "",
-      status: "Pendente",
-      focusOrder: orderCode,
-      focusRetry: true
-    });
     return;
   }
   sessionStorage.removeItem("acparkFocusReleaseOrder");
-  const head = card.querySelector("[data-toggle-order]");
-  const body = card.querySelector(".order-accordion-body");
   card.classList.add("order-alert-focus");
-  card.classList.add("is-open");
-  head?.setAttribute("aria-expanded", "true");
-  body?.classList.remove("hidden");
   card.scrollIntoView({ behavior: "smooth", block: "center" });
   setTimeout(() => card.classList.remove("order-alert-focus"), 4500);
 }
@@ -5626,16 +5675,11 @@ function bindReleaseInteractions(from, to, activeStatus, root = document, pdvId 
     const orderCode = card?.dataset.order || "";
     const orderStatus = card?.dataset.orderStatus || "";
     if (!orderCode) return;
-    const isPartialDelete = orderStatus === "Liberação Parcial";
     const confirmed = await confirmSystem({
       title: "Excluir pedido",
-      message: isPartialDelete
-        ? `Excluir somente a parte pendente da Liberação Parcial do pedido ${orderCode}?`
-        : `Excluir o pedido ${orderCode} completo?`,
-      consequence: isPartialDelete
-        ? "O que já foi liberado para retirada ou finalizado será preservado."
-        : "Se houver baixa de estoque ligada ao pedido, o sistema fará o ajuste conforme a regra atual.",
-      confirmLabel: isPartialDelete ? "Excluir pendência" : "Excluir pedido",
+      message: `Excluir o pedido ${orderCode} completo?`,
+      consequence: "Se houver baixa de estoque ligada ao pedido, o sistema fará o ajuste conforme a regra atual.",
+      confirmLabel: "Excluir pedido",
       danger: true
     });
     if (!confirmed) return;
@@ -5842,13 +5886,7 @@ function bindReleaseInteractions(from, to, activeStatus, root = document, pdvId 
             : "Não há produtos disponíveis neste card para alterar o status.", "error");
           return;
         }
-        const hasPartialRelease = btn.dataset.autoPartial === "true" && rows.some((tr) => {
-          if (tr.querySelector(".remover")?.checked) return false;
-          const requested = Number(tr.dataset.requested || 0);
-          const released = Number(tr.querySelector(".liberada")?.value ?? tr.dataset.released ?? 0);
-          return released > 0 && released < requested;
-        });
-        const nextStatus = hasPartialRelease ? "Liberação Parcial" : btn.dataset.status;
+        const nextStatus = btn.dataset.status;
         await request("/api/admin/order-flow", {
           method: "POST",
           body: JSON.stringify({
@@ -6309,9 +6347,9 @@ function orderCard(group) {
   const hiddenCompletedItems = [];
   const tableItems = [...visibleItems, ...hiddenCompletedItems];
   const unavailableItems = visibleItems.filter((item) => Number(item.saldo) <= 0);
-  const isWithdrawalStatus = ["Aguardando Retirada", "Liberação Parcial"].includes(first.status);
-  const isEditableStatus = ["Em Andamento", "Liberação Parcial"].includes(first.status);
-  const canRemoveProducts = ["Em Andamento", "Liberação Parcial"].includes(first.status);
+  const isWithdrawalStatus = first.status === "Aguardando Retirada";
+  const isEditableStatus = first.status === "Em Andamento";
+  const canRemoveProducts = first.status === "Em Andamento";
   const stockValue = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
   const statusTime = first.status === "Pendente"
     ? `Pendente desde ${moneyDate(first.criado_em)}`
@@ -6323,11 +6361,9 @@ function orderCard(group) {
   const actions = first.status === "Pendente"
     ? `<button class="btn flow" data-status="Em Andamento">Enviar para em andamento</button>`
     : first.status === "Em Andamento"
-      ? `<button class="btn secondary flow" data-status="Pendente">Voltar para pendente</button><button class="btn secondary save-release-draft" type="button">Salvar rascunho</button><button class="btn secondary flow" data-status="Liberação Parcial">Liberar parcial</button><button class="btn secondary add-almox-product" type="button">+ Produto</button><button class="btn flow" data-status="Aguardando Retirada" data-release-mode="entered-only">Enviar para retirada</button>`
+      ? `<button class="btn secondary flow" data-status="Pendente">Voltar para pendente</button><button class="btn secondary save-release-draft" type="button">Salvar rascunho</button><button class="btn secondary add-almox-product" type="button">+ Produto</button><button class="btn flow" data-status="Aguardando Retirada" data-release-mode="entered-only">Enviar para retirada</button>`
       : first.status === "Aguardando Retirada" && !first.retirada_assinatura
         ? `<button class="btn secondary flow" data-status="Em Andamento">Voltar para em andamento</button><button class="btn confirm-order-withdrawal-open" type="button">Confirmar retirada com assinatura</button>`
-        : first.status === "Liberação Parcial"
-          ? `<button class="btn flow" data-status="Aguardando Retirada" data-release-mode="entered-only">Liberar para retirada</button>`
         : first.status === "Finalizado"
           ? `<button class="btn secondary flow" data-status="Em Andamento">Voltar para em andamento</button>${first.retirada_assinatura ? `<button class="btn secondary view-order-withdrawal" type="button" data-order="${esc(first.codigo_pedido)}" data-signature="${esc(first.retirada_assinatura)}" data-responsible="${esc(first.retirada_responsavel || "")}" data-date="${esc(first.retirada_em ? moneyDate(first.retirada_em) : "")}" data-user="${esc(first.retirada_usuario_almoxarifado || "")}" data-pdv="${esc(first.pdv || "")}" data-items='${withdrawalItemsAttribute(orderReleasedItems(group))}'>Visualizar comprovante de retirada</button>` : ""}`
         : first.retirada_assinatura
@@ -6387,7 +6423,7 @@ function orderCard(group) {
                 : "";
         const saldoClass = saldo < 0 ? "negative" : saldo === 0 ? "zero" : "positive";
         const saldoLabel = saldo < 0 ? "Saldo negativo" : saldo === 0 ? "Saldo zerado" : "Saldo disponível";
-        const canBulkDeleteItem = canRemoveProducts && !(first.status === "Liberação Parcial" && savedReleaseQty > 0);
+        const canBulkDeleteItem = canRemoveProducts;
         return `
         <tr data-id="${o.id}" data-version="${o.version || 1}" data-requested="${o.quantidade_solicitada}" data-product="${esc(o.produto)}" data-sku="${esc(o.sku_produto || "")}" data-released="${esc(releasedQty)}" class="release-item-row ${rowState} ${isRemoved ? "is-marked-remove" : ""} ${hiddenCompleted ? "hidden" : ""}">
           <td class="release-remove-cell">
@@ -6651,7 +6687,6 @@ function openOrderWithdrawalReceipt({ orderCode, pdv, responsible, date, user, s
 function openOrderWithdrawalModal(card, { from, to, pdvId = "" }) {
   const orderCode = card?.dataset.order || "";
   const currentStatus = card?.dataset.orderStatus || "";
-  const isPartialWithdrawal = currentStatus === "Liberação Parcial";
   const headText = card?.querySelector(".order-accordion-head strong")?.textContent || `Pedido ${orderCode}`;
   const meta = card?.querySelector(".order-accordion-head small")?.textContent || "";
   const items = orderWithdrawalItemsFromCard(card);
@@ -6671,7 +6706,7 @@ function openOrderWithdrawalModal(card, { from, to, pdvId = "" }) {
         </div>
         <button class="icon-action close-order-withdrawal" type="button" aria-label="Fechar">&times;</button>
       </div>
-      <p class="damage-status-warning">${isPartialWithdrawal ? "Declaro que conferi e recebi os produtos liberados parcialmente neste pedido." : "Declaro que conferi e recebi os produtos relacionados neste pedido."}</p>
+      <p class="damage-status-warning">Declaro que conferi e recebi os produtos relacionados neste pedido.</p>
       ${table(["Produto", "Quantidade liberada"], items.map((item) => `<tr><td>${esc(item.produto)}</td><td>${esc(item.liberada)}</td></tr>`))}
       <label>Nome do responsável pela retirada
         <input name="responsavel_retirada" placeholder="Nome completo" autocomplete="off" />
@@ -6783,9 +6818,9 @@ function openOrderWithdrawalModal(card, { from, to, pdvId = "" }) {
           assinatura: hidden.value
         })
       });
-      toast(isPartialWithdrawal ? "Retirada parcial confirmada com sucesso." : "Retirada confirmada com sucesso. O pedido foi finalizado.");
+      toast("Retirada confirmada com sucesso. O pedido foi finalizado.");
       close();
-      await viewRelease({ from, to, pdvId, status: isPartialWithdrawal ? "Liberação Parcial" : "Finalizado" });
+      await viewRelease({ from, to, pdvId, status: "Finalizado" });
     } catch (error) {
       toast(error.message || "Não foi possível confirmar a retirada.", "error");
       confirm.disabled = false;
@@ -6794,24 +6829,41 @@ function openOrderWithdrawalModal(card, { from, to, pdvId = "" }) {
   });
 }
 
-async function viewHistory(autoOnly, filters = {}) {
-  const activeStatus = filters.status || "";
-  const from = filters.from || "";
-  const to = filters.to || "";
-  const pdvId = filters.pdvId || "";
-  const statuses = ["", ...orderStatuses];
+function normalizeHistoryFilters(filters = {}) {
+  return {
+    status: filters.status || "",
+    from: filters.from || "",
+    to: filters.to || "",
+    pdvId: filters.pdvId || ""
+  };
+}
+
+function historyFilterSignature(filters = {}) {
+  return JSON.stringify(normalizeHistoryFilters(filters));
+}
+
+function historyQueryParams(autoOnly, filters = {}, options = {}) {
+  const { includePoint = true } = options;
+  const normalized = normalizeHistoryFilters(filters);
   const params = new URLSearchParams({ auto: autoOnly ? "1" : "0" });
-  if (activeStatus) params.set("status", activeStatus);
-  if (from) params.set("from", from);
-  if (to) params.set("to", to);
-  if (pdvId) params.set("pdvId", pdvId);
+  if (normalized.status) params.set("status", normalized.status);
+  if (normalized.from) params.set("from", normalized.from);
+  if (normalized.to) params.set("to", normalized.to);
+  if (includePoint && normalized.pdvId) params.set("pdvId", normalized.pdvId);
+  return params;
+}
+
+async function viewHistory(autoOnly, filters = {}, options = {}) {
+  document.querySelectorAll(".history-actions-dropdown").forEach((menu) => menu.remove());
+  const activeFilters = normalizeHistoryFilters(filters);
+  const activeStatus = activeFilters.status;
+  const from = activeFilters.from;
+  const to = activeFilters.to;
+  const pdvId = activeFilters.pdvId;
+  const statuses = ["", ...orderStatuses];
+  const params = historyQueryParams(autoOnly, activeFilters);
   const data = await request(`/api/admin/history?${params.toString()}`);
-  const grouped = Object.values(data.history.reduce((acc, row) => {
-    const key = orderGroupKey(row);
-    acc[key] ||= [];
-    acc[key].push(row);
-    return acc;
-  }, {}));
+  const grouped = groupHistoryByPointAndDate(data.history || []);
   const periodLabel = from || to ? `${from ? moneyDate(from) : "Início"} até ${to ? moneyDate(to) : "Hoje"}` : "Todos os períodos";
   const selectedPdv = (state.pdvs || []).find((pdv) => String(pdv.id) === String(pdvId));
   const pointLabel = selectedPdv?.nome || "Todos os pontos";
@@ -6840,9 +6892,20 @@ async function viewHistory(autoOnly, filters = {}) {
           <label class="field-date">Até
             <input name="to" type="date" value="${esc(to)}" />
           </label>
-          <div class="filter-actions">
+          <div class="filter-actions history-menu-actions">
             <button class="btn" type="submit">Filtrar</button>
-            ${!autoOnly ? `<button class="btn secondary" id="print-history" type="button">Imprimir relatório</button>` : ""}
+            <div class="history-actions-menu">
+              <button class="history-actions-toggle" id="history-actions-toggle" type="button" aria-label="Opções do relatório" aria-expanded="false" aria-controls="history-actions-dropdown">
+                <span></span>
+                <span></span>
+                <span></span>
+              </button>
+              <div class="sheet-actions-menu history-actions-dropdown hidden" id="history-actions-dropdown">
+                <button class="btn secondary" id="export-history-current" type="button">${pdvId ? "Exportar ponto" : "Exportar planilha"}</button>
+                <button class="btn secondary" id="export-history-all" type="button">Exportar todos os pontos</button>
+                ${!autoOnly ? `<button class="btn secondary" id="print-history" type="button">Imprimir relatório</button>` : ""}
+              </div>
+            </div>
           </div>
         </form>
       </section>
@@ -6855,26 +6918,285 @@ async function viewHistory(autoOnly, filters = {}) {
             <p class="text-sm font-bold text-[color:var(--ac-teal-dark)]">${esc(periodLabel)} | ${esc(pointLabel)}${activeStatus ? ` | ${esc(activeStatus)}` : ""}</p>
           </div>
         </div>
-        ${grouped.map((group) => historyOrderCard(group)).join("") || `<div class="card">Nenhum pedido encontrado.</div>`}
+        <div class="history-screen-groups">
+          ${renderHistoryPointGroups(grouped)}
+        </div>
+        ${renderHistoryPrintReport(grouped)}
       </section>
     </section>`);
-  document.querySelector("#history-filter").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const form = Object.fromEntries(new FormData(event.currentTarget));
-    await viewHistory(autoOnly, form);
-  });
-  document.querySelector("#print-history")?.addEventListener("click", async () => {
+  const historyForm = document.querySelector("#history-filter");
+  const historyActionsToggle = document.querySelector("#history-actions-toggle");
+  const historyActionsDropdown = document.querySelector("#history-actions-dropdown");
+  if (historyActionsDropdown) document.body.appendChild(historyActionsDropdown);
+  const formFilters = () => normalizeHistoryFilters(Object.fromEntries(new FormData(historyForm)));
+  let closeHistoryActionsOnOutside = null;
+  const positionHistoryActions = () => {
+    if (!historyActionsToggle || !historyActionsDropdown) return;
+    const rect = historyActionsToggle.getBoundingClientRect();
+    const menuRect = historyActionsDropdown.getBoundingClientRect();
+    const menuWidth = Math.max(menuRect.width || 270, 270);
+    const left = Math.min(Math.max(12, rect.right - menuWidth), window.innerWidth - menuWidth - 12);
+    const top = Math.min(rect.bottom + 8, window.innerHeight - 12);
+    historyActionsDropdown.style.left = `${left}px`;
+    historyActionsDropdown.style.right = "auto";
+    historyActionsDropdown.style.top = `${top}px`;
+  };
+  const closeHistoryActions = () => {
+    historyActionsDropdown?.classList.add("hidden");
+    historyActionsToggle?.setAttribute("aria-expanded", "false");
+    historyActionsDropdown?.removeAttribute("style");
+    if (closeHistoryActionsOnOutside) {
+      document.removeEventListener("click", closeHistoryActionsOnOutside);
+      window.removeEventListener("resize", positionHistoryActions);
+      window.removeEventListener("scroll", positionHistoryActions, true);
+      closeHistoryActionsOnOutside = null;
+    }
+  };
+  const printRenderedHistory = async () => {
     document.body.classList.add("printing-history");
     await waitForPrintReady(document.querySelector(".print-history-area"));
     window.print();
     schedulePrintCleanup(() => document.body.classList.remove("printing-history"));
+  };
+
+  historyActionsToggle?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const isClosed = historyActionsDropdown.classList.contains("hidden");
+    if (!isClosed) {
+      closeHistoryActions();
+      return;
+    }
+    historyActionsDropdown.classList.remove("hidden");
+    historyActionsToggle.setAttribute("aria-expanded", "true");
+    positionHistoryActions();
+    requestAnimationFrame(positionHistoryActions);
+    closeHistoryActionsOnOutside = (outsideEvent) => {
+      if (historyActionsDropdown.contains(outsideEvent.target) || historyActionsToggle.contains(outsideEvent.target)) return;
+      closeHistoryActions();
+    };
+    setTimeout(() => document.addEventListener("click", closeHistoryActionsOnOutside), 0);
+    window.addEventListener("resize", positionHistoryActions);
+    window.addEventListener("scroll", positionHistoryActions, true);
+  });
+
+  historyForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await viewHistory(autoOnly, formFilters());
+  });
+  document.querySelector("#print-history")?.addEventListener("click", async () => {
+    closeHistoryActions();
+    const selectedFilters = formFilters();
+    if (historyFilterSignature(selectedFilters) !== historyFilterSignature(activeFilters)) {
+      await viewHistory(autoOnly, selectedFilters, { printAfterRender: true });
+      return;
+    }
+    await printRenderedHistory();
+  });
+  document.querySelector("#export-history-current")?.addEventListener("click", async () => {
+    closeHistoryActions();
+    const selectedFilters = formFilters();
+    const selectedPoint = (state.pdvs || []).find((pdv) => String(pdv.id) === String(selectedFilters.pdvId));
+    const selectedPointLabel = selectedPoint?.nome || "Todos os pontos";
+    const selectedData = historyFilterSignature(selectedFilters) === historyFilterSignature(activeFilters)
+      ? data
+      : await request(`/api/admin/history?${historyQueryParams(autoOnly, selectedFilters).toString()}`);
+    exportHistoryReport(selectedData.history || [], {
+      filename: selectedFilters.pdvId ? `historico_${slugFileName(selectedPointLabel)}.csv` : "historico_todos_os_pontos.csv"
+    });
+  });
+  document.querySelector("#export-history-all")?.addEventListener("click", async () => {
+    closeHistoryActions();
+    const selectedFilters = formFilters();
+    const allParams = historyQueryParams(autoOnly, selectedFilters, { includePoint: false });
+    const allData = await request(`/api/admin/history?${allParams.toString()}`);
+    exportHistoryReport(allData.history || [], { filename: "historico_todos_os_pontos.csv" });
   });
   bindOrderToggles();
+  if (options.printAfterRender) await printRenderedHistory();
+}
+
+function historyDateKey(row = {}) {
+  return String(row.retirada_em || row.data_hora || "").slice(0, 10) || "Sem data";
+}
+
+function historyDateLabel(dateKey) {
+  if (!dateKey || dateKey === "Sem data") return "Sem data";
+  return moneyDate(dateKey);
+}
+
+function groupHistoryByPointAndDate(rows = []) {
+  const points = new Map();
+  for (const row of rows) {
+    const pointName = row.pdv || "Sem ponto";
+    if (!points.has(pointName)) {
+      points.set(pointName, { pdv: pointName, dates: new Map() });
+    }
+    const point = points.get(pointName);
+    const dateKey = historyDateKey(row);
+    if (!point.dates.has(dateKey)) {
+      point.dates.set(dateKey, { dateKey, orders: new Map() });
+    }
+    const dateGroup = point.dates.get(dateKey);
+    const orderKey = orderGroupKey(row);
+    if (!dateGroup.orders.has(orderKey)) dateGroup.orders.set(orderKey, []);
+    dateGroup.orders.get(orderKey).push(row);
+  }
+  return [...points.values()]
+    .sort((left, right) => left.pdv.localeCompare(right.pdv, "pt-BR"))
+    .map((point) => ({
+      ...point,
+      dates: [...point.dates.values()]
+        .sort((left, right) => String(right.dateKey).localeCompare(String(left.dateKey)))
+        .map((dateGroup) => ({
+          ...dateGroup,
+          orders: [...dateGroup.orders.values()].sort((left, right) => {
+            const leftTime = new Date(left[0]?.retirada_em || left[0]?.data_hora || 0).getTime();
+            const rightTime = new Date(right[0]?.retirada_em || right[0]?.data_hora || 0).getTime();
+            return rightTime - leftTime;
+          })
+        }))
+    }));
+}
+
+function renderHistoryPointGroups(pointGroups = []) {
+  if (!pointGroups.length) return `<div class="card">Nenhum pedido encontrado.</div>`;
+  return pointGroups.map((point) => `
+    <section class="history-point-group">
+      <div class="category-product-list-head">
+        <strong>${esc(point.pdv)}</strong>
+      </div>
+      <div class="grid gap-3">
+        ${point.dates.map((dateGroup) => `
+          <section class="history-date-group">
+            <p class="eyebrow">${esc(historyDateLabel(dateGroup.dateKey))}</p>
+            <div class="grid gap-3">
+              ${dateGroup.orders.map((group) => historyOrderCard(group)).join("")}
+            </div>
+          </section>`).join("")}
+      </div>
+    </section>`).join("");
+}
+
+function historyTimeLabel(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return moneyDate(value);
+  return date.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function historyOrderPrintMeta(first = {}) {
+  const parts = [
+    first.solicitante || "-",
+    historyTimeLabel(first.data_hora),
+    first.status || "-"
+  ];
+  if (first.retirada_usuario_almoxarifado) parts.push(`Almox: ${first.retirada_usuario_almoxarifado}`);
+  if (first.retirada_em) parts.push(`Finalizado em ${moneyDate(first.retirada_em)}`);
+  return parts.join(" | ");
+}
+
+function historyOrderPrintRows(group = []) {
+  const first = group[0] || {};
+  const observation = first.observacao
+    ? `<div class="history-print-observation">Obs.: ${esc(String(first.observacao).slice(0, 180))}${String(first.observacao).length > 180 ? "..." : ""}</div>`
+    : "";
+  return `
+    <tr class="pedido-header-row">
+      <td colspan="4">
+        <strong>Pedido ${esc(first.codigo_pedido || "-")} - ${esc(first.pdv || "-")}</strong>
+        <span>${esc(historyOrderPrintMeta(first))}</span>
+        ${observation}
+      </td>
+    </tr>
+    ${group.map((item) => `
+      <tr class="pedido-product-row">
+        <td>${esc(item.produto || "-")}</td>
+        <td>${esc(item.quantidade_solicitada ?? 0)}</td>
+        <td>${esc(item.quantidade_liberada ?? 0)}</td>
+        <td>${esc(item.status || "-")}</td>
+      </tr>`).join("")}`;
+}
+
+function renderHistoryPrintReport(pointGroups = []) {
+  if (!pointGroups.length) return `<div class="history-print-report card">Nenhum pedido encontrado.</div>`;
+  return `<div class="history-print-report">
+    ${pointGroups.map((point) => `
+      <section class="history-print-point">
+        <h3>${esc(point.pdv)}</h3>
+        ${point.dates.map((dateGroup) => `
+          <section class="history-print-date">
+            <table class="historico-pedidos-print">
+              <thead>
+                <tr>
+                  <th>Produto</th>
+                  <th>Solicitado</th>
+                  <th>Liberado</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr class="history-print-date-row">
+                  <td colspan="4">${esc(historyDateLabel(dateGroup.dateKey))}</td>
+                </tr>
+                ${dateGroup.orders.map((group) => historyOrderPrintRows(group)).join("")}
+              </tbody>
+            </table>
+          </section>`).join("")}
+      </section>`).join("")}
+  </div>`;
+}
+
+function slugFileName(value = "relatorio") {
+  return String(value || "relatorio")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/gi, "_")
+    .replace(/^_+|_+$/g, "")
+    .toLowerCase() || "relatorio";
+}
+
+function exportHistoryReport(rows = [], { filename = "historico_pedidos.csv" } = {}) {
+  const headers = [
+    "PDV",
+    "Data",
+    "Pedido",
+    "Solicitante",
+    "Produto",
+    "Quantidade solicitada",
+    "Quantidade liberada",
+    "Status",
+    "Responsável retirada",
+    "Data retirada",
+    "Usuário almoxarifado",
+    "Observação"
+  ];
+  const dataRows = [...rows]
+    .sort((left, right) => {
+      const pointDiff = String(left.pdv || "").localeCompare(String(right.pdv || ""), "pt-BR");
+      if (pointDiff) return pointDiff;
+      const dateDiff = String(historyDateKey(right)).localeCompare(String(historyDateKey(left)));
+      if (dateDiff) return dateDiff;
+      return String(left.codigo_pedido || "").localeCompare(String(right.codigo_pedido || ""));
+    })
+    .map((row) => [
+      row.pdv || "",
+      historyDateKey(row),
+      row.codigo_pedido || "",
+      row.solicitante || "",
+      row.produto || "",
+      row.quantidade_solicitada || 0,
+      row.quantidade_liberada || 0,
+      row.status || "",
+      row.retirada_responsavel || "",
+      row.retirada_em ? moneyDate(row.retirada_em) : "",
+      row.retirada_usuario_almoxarifado || "",
+      row.observacao || ""
+    ]);
+  downloadCsv(filename, [headers, ...dataRows]);
 }
 
 function historyOrderCard(group) {
   const first = group[0];
-  const signatureRow = group.find((item) => item.status === "Finalizado" && item.retirada_assinatura);
   return `<article class="card order-accordion" data-order="${esc(first.codigo_pedido)}">
     <button class="order-accordion-head" type="button" data-toggle-order aria-expanded="false">
       <span class="order-arrow">&#9662;</span>
@@ -6893,12 +7215,6 @@ function historyOrderCard(group) {
           <td>${h.quantidade_liberada}</td>
           <td>${statusPill(h.status)}</td>
         </tr>`))}
-      ${signatureRow ? `
-        <section class="history-signature-proof">
-          <h4>Assinatura da retirada</h4>
-          <p>${esc(signatureRow.retirada_responsavel || "-")} | ${signatureRow.retirada_em ? moneyDate(signatureRow.retirada_em) : "-"} | ${esc(signatureRow.retirada_usuario_almoxarifado || "Almoxarifado")}</p>
-          <img src="${esc(signatureRow.retirada_assinatura)}" alt="Assinatura da retirada" />
-        </section>` : ""}
     </div>
   </article>`;
 }
@@ -7110,9 +7426,9 @@ async function viewConfigV2() {
       <div class="config-tabs" role="tablist" aria-label="Configurações do sistema">
         <button class="config-tab is-active" type="button" data-config-tab="manage" role="tab" aria-selected="true">Gerenciar PDVs</button>
         <button class="config-tab" type="button" data-config-tab="pdv" role="tab" aria-selected="false">Criar PDV</button>
+        <button class="config-tab" type="button" data-config-tab="alerts" role="tab" aria-selected="false">Alertas</button>
         <button class="config-tab" type="button" data-config-tab="security" role="tab" aria-selected="false">Segurança</button>
         <button class="config-tab" type="button" data-config-tab="apis" role="tab" aria-selected="false">APIs</button>
-        <button class="config-tab" type="button" data-config-tab="alerts" role="tab" aria-selected="false">Alertas</button>
       </div>
 
       <div class="config-tab-panels">
@@ -7158,6 +7474,10 @@ async function viewConfigV2() {
           </form>
         </section>
 
+        <section class="config-panel hidden" data-config-panel="alerts" role="tabpanel">
+          ${renderOrderAlertSettings()}
+        </section>
+
         <section class="config-panel hidden" data-config-panel="security" role="tabpanel">
           <form id="security-form" class="card grid gap-3">
             <h3 class="text-xl font-black">Segurança do almoxarifado</h3>
@@ -7180,10 +7500,6 @@ async function viewConfigV2() {
             <p class="text-sm text-slate-500">Cadastre OMIE e outras APIs na tela Integrações. As credenciais são criptografadas e não aparecem nas respostas da API.</p>
             <button class="btn" id="open-integrations-center" type="button">Abrir central de integrações</button>
           </form>
-        </section>
-
-        <section class="config-panel hidden" data-config-panel="alerts" role="tabpanel">
-          ${renderOrderAlertSettings()}
         </section>
       </div>
     </section>`);

@@ -9,19 +9,13 @@ export async function handleEstoqueRoutes(req, res, context) {
     const rows = await query(
       `SELECT p.sku, p.nome, p.qtd_total AS estoque_central,
               COALESCE(string_agg(DISTINCT prc.categoria, ', ' ORDER BY prc.categoria), '') AS categoria,
-              e.quantidade,
-              COALESCE(e.saldo_omie, e.quantidade, 0) AS saldo_omie,
-              COALESCE(e.quantidade_reservada_acpark, 0) AS quantidade_reservada_acpark,
-              COALESCE(e.saldo_disponivel_acpark, COALESCE(e.saldo_omie, e.quantidade, 0) - COALESCE(e.quantidade_reservada_acpark, 0)) AS saldo_disponivel_acpark,
-              e.ultima_sincronizacao,
-              COALESCE(e.sincronizacao_status, 'MANUAL') AS sincronizacao_status,
-              e.estoque_minimo, e.estoque_maximo
+              e.quantidade, e.estoque_minimo, e.estoque_maximo
        FROM estoque_pdv e
        JOIN produtos p ON p.sku = e.sku_produto
        JOIN produto_categorias prc ON prc.sku_produto = p.sku
        JOIN pdv_categorias pc ON pc.pdv_id = e.pdv_id AND pc.categoria = prc.categoria
        WHERE e.pdv_id = $1 AND e.permitido = TRUE AND p.ativo = TRUE
-       GROUP BY p.sku, p.nome, p.qtd_total, e.quantidade, e.saldo_omie, e.quantidade_reservada_acpark, e.saldo_disponivel_acpark, e.ultima_sincronizacao, e.sincronizacao_status, e.estoque_minimo, e.estoque_maximo
+       GROUP BY p.sku, p.nome, p.qtd_total, e.quantidade, e.estoque_minimo, e.estoque_maximo
        ORDER BY p.nome`,
       [pdvId]
     );
@@ -41,11 +35,6 @@ export async function handleEstoqueRoutes(req, res, context) {
         `SELECT p.sku, p.nome, p.qtd_total AS estoque_central,
                 COALESCE(string_agg(DISTINCT pcg.categoria, ', ' ORDER BY pcg.categoria), '') AS categoria,
                 TRUE AS permitido, COALESCE(e.quantidade, 0) quantidade,
-                COALESCE(e.saldo_omie, e.quantidade, 0) AS saldo_omie,
-                COALESCE(e.quantidade_reservada_acpark, 0) AS quantidade_reservada_acpark,
-                COALESCE(e.saldo_disponivel_acpark, COALESCE(e.saldo_omie, e.quantidade, 0) - COALESCE(e.quantidade_reservada_acpark, 0)) AS saldo_disponivel_acpark,
-                e.ultima_sincronizacao,
-                COALESCE(e.sincronizacao_status, 'MANUAL') AS sincronizacao_status,
                 COALESCE(e.estoque_minimo, 0) estoque_minimo, COALESCE(e.estoque_maximo, 0) estoque_maximo
          FROM produtos p
          JOIN produto_categorias pcg ON pcg.sku_produto = p.sku
@@ -54,7 +43,7 @@ export async function handleEstoqueRoutes(req, res, context) {
            COALESCE(array_length($2::text[], 1), 0) > 0
            AND pcg.categoria = ANY($2::text[])
          )
-         GROUP BY p.sku, p.nome, p.qtd_total, e.quantidade, e.saldo_omie, e.quantidade_reservada_acpark, e.saldo_disponivel_acpark, e.ultima_sincronizacao, e.sincronizacao_status, e.estoque_minimo, e.estoque_maximo
+         GROUP BY p.sku, p.nome, p.qtd_total, e.quantidade, e.estoque_minimo, e.estoque_maximo
          ORDER BY p.nome`,
         [pdvId, categorias]
       );

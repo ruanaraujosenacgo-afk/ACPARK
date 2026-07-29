@@ -11,8 +11,8 @@ import { syncPdvAllowedProducts } from "./modules/estoque/estoque.service.js";
 import { handlePedidosRoutes } from "./modules/pedidos/pedidos.routes.js";
 import { handleAvariasRoutes } from "./modules/avarias/avarias.routes.js";
 import { handleOmieRoutes } from "./modules/omie/omie.routes.js";
-import { handleOrderAlertRoutes } from "./modules/order-alerts/order-alerts.routes.js";
 import { handleIntegrationWebhookRoutes, handleIntegrationsRoutes } from "./modules/integrations/integrations.routes.js";
+import { handleOrderAlertRoutes } from "./modules/order-alerts/order-alerts.routes.js";
 import { runOmieSchedulerTick, startOmieScheduler } from "./services/integrations/omie/omie.scheduler.js";
 import { normalizeCategories, normalizeCategoryList, normalizeText, readBody, send } from "./utils/http.js";
 
@@ -134,27 +134,26 @@ async function api(req, res) {
     return send(res, 200, { pdvs: await query("SELECT id, nome FROM pdvs ORDER BY nome") });
   }
 
-  if (await handleIntegrationWebhookRoutes(req, res, { method, url })) return;
-
-  if (url.pathname === "/api/cron/omie-sync" && (method === "POST" || method === "GET")) {
-    const expected = process.env.CRON_SECRET || "";
-    const received = req.headers.authorization?.replace(/^Bearer\s+/i, "") || url.searchParams.get("secret") || "";
-    if (!expected || expected !== received) return send(res, 401, { error: "Cron nao autorizado." });
-    const result = await runOmieSchedulerTick({ actor: "vercel-cron", processLimit: 5 });
-    return send(res, 200, { ok: true, ...result });
+  if (url.pathname === "/api/cron/omie-sync") {
+    const cronSecret = process.env.CRON_SECRET;
+    if (cronSecret && req.headers.authorization !== `Bearer ${cronSecret}`) {
+      return send(res, 401, { error: "Cron nao autorizado." });
+    }
+    const result = await runOmieSchedulerTick();
+    return send(res, 200, { ok: true, result });
   }
+
+  if (await handleIntegrationWebhookRoutes(req, res, { method, requireUser, url })) return;
 
   const user = requireUser(req, res);
   if (!user) return;
 
   await processAutoOrders();
 
-  if (await handleOrderAlertRoutes(req, res, { method, url, user })) return;
-
   if (url.pathname === "/api/bootstrap") {
     const [pdvs, products, categories, configRows] = await Promise.all([
       query(`
-        SELECT p.id, p.nome, p.is_cozinha, p.categoria,
+        SELECT p.id, p.nome, p.codigo_orion, p.is_cozinha, p.categoria,
                COALESCE(ARRAY(
                  SELECT pc.categoria
                  FROM pdv_categorias pc
@@ -174,7 +173,15 @@ async function api(req, res) {
         GROUP BY p.sku, p.nome, p.qtd_total, p.ativo, p.origem
         ORDER BY p.nome`),
       query("SELECT nome FROM categorias ORDER BY nome"),
-      []
+      user.role === "admin"
+        ? query(`
+            SELECT chave, valor
+            FROM configuracoes
+            WHERE chave IN (
+              'omie_app_key',
+              'omie_app_secret'
+            )`)
+        : []
     ]);
     const config = {};
     for (const row of configRows) {
@@ -186,8 +193,9 @@ async function api(req, res) {
   if (await handleEstoqueRoutes(req, res, { method, requireUser, url, user })) return;
   if (await handlePedidosRoutes(req, res, { method, requireUser, url, user })) return;
   if (await handleAvariasRoutes(req, res, { method, requireUser, url, user })) return;
-  if (await handleIntegrationsRoutes(req, res, { method, requireUser, url, user })) return;
   if (await handleOmieRoutes(req, res, { method, requireUser, url, user })) return;
+  if (await handleIntegrationsRoutes(req, res, { method, requireUser, url, user })) return;
+  if (await handleOrderAlertRoutes(req, res, { method, url, user })) return;
 
   if (url.pathname === "/api/admin/products") {
     if (!requireUser(req, res, "admin")) return;
@@ -347,7 +355,7 @@ async function api(req, res) {
     const body = method === "GET" ? {} : await readBody(req);
     if (method === "GET") {
       return send(res, 200, { pdvs: await query(`
-        SELECT p.id, p.nome, p.is_cozinha, p.categoria,
+        SELECT p.id, p.nome, p.codigo_orion, p.is_cozinha, p.categoria,
                COALESCE(ARRAY(
                  SELECT pc.categoria
                  FROM pdv_categorias pc
@@ -365,11 +373,11 @@ async function api(req, res) {
       const categorias = normalizeCategories(body.categorias);
       if (!nome || !senha) return send(res, 400, { error: "Nome e senha são obrigatórios." });
       const pdv = await query(
-        `INSERT INTO pdvs (nome, senha, is_cozinha, categoria)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO pdvs (nome, senha, codigo_orion, is_cozinha, categoria)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (nome) DO NOTHING
          RETURNING id`,
-        [nome, hashPassword(senha), false, categoria]
+        [nome, hashPassword(senha), normalizeText(body.codigo_orion, 60) || null, false, categoria]
       );
       const pdvId = pdv[0]?.id;
       if (pdvId) {
@@ -398,9 +406,10 @@ async function api(req, res) {
       const categorias = normalizeCategories(body.categorias);
       const nome = normalizeText(body.nome, 120).toUpperCase();
       if (!pdvId || !nome) return send(res, 400, { error: "PDV inválido." });
-      await query("UPDATE pdvs SET nome = $2, is_cozinha = $3, categoria = $4 WHERE id = $1", [
+      await query("UPDATE pdvs SET nome = $2, codigo_orion = $3, is_cozinha = $4, categoria = $5 WHERE id = $1", [
         pdvId,
         nome,
+        normalizeText(body.codigo_orion, 60) || null,
         false,
         normalizeText(body.categoria, 120).toUpperCase() || null
       ]);
@@ -576,8 +585,13 @@ async function api(req, res) {
          FROM pedidos p
          JOIN pdvs pd ON pd.id = p.pdv_id
          JOIN produtos pr ON pr.sku = p.sku_produto
-         WHERE ($1::date IS NULL OR p.data_hora::date >= $1::date)
-           AND ($2::date IS NULL OR p.data_hora::date <= $2::date)
+         WHERE (CASE
+                  WHEN p.status = 'Liberado' THEN 'Finalizado'
+                  WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
+                  ELSE p.status
+                END) = 'Finalizado'
+           AND ($1::date IS NULL OR COALESCE(p.retirada_em, p.liberado_em, p.data_hora)::date >= $1::date)
+           AND ($2::date IS NULL OR COALESCE(p.retirada_em, p.liberado_em, p.data_hora)::date <= $2::date)
            AND ($3::text IS NULL OR pr.nome ILIKE $3 OR pr.sku ILIKE $3)
          GROUP BY pd.nome
          ORDER BY total DESC
@@ -585,14 +599,19 @@ async function api(req, res) {
         [from || null, to || null, productSearchLike]
       )
       : await query(
-        `SELECT pd.nome AS pdv, pr.sku, pr.nome AS produto, SUM(p.quantidade_solicitada)::int AS total
+        `SELECT NULL::text AS pdv, pr.sku, pr.nome AS produto,
+                SUM(COALESCE(NULLIF(p.quantidade_liberada, 0), p.quantidade_solicitada))::int AS total
          FROM pedidos p
-         JOIN pdvs pd ON pd.id = p.pdv_id
          JOIN produtos pr ON pr.sku = p.sku_produto
-         WHERE ($1::date IS NULL OR p.data_hora::date >= $1::date)
-           AND ($2::date IS NULL OR p.data_hora::date <= $2::date)
+         WHERE (CASE
+                  WHEN p.status = 'Liberado' THEN 'Finalizado'
+                  WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
+                  ELSE p.status
+                END) = 'Finalizado'
+           AND ($1::date IS NULL OR COALESCE(p.retirada_em, p.liberado_em, p.data_hora)::date >= $1::date)
+           AND ($2::date IS NULL OR COALESCE(p.retirada_em, p.liberado_em, p.data_hora)::date <= $2::date)
            AND ($3::text IS NULL OR pr.nome ILIKE $3 OR pr.sku ILIKE $3)
-         GROUP BY pd.nome, pr.sku, pr.nome
+         GROUP BY pr.sku, pr.nome
          ORDER BY total DESC
          LIMIT 20`,
         [from || null, to || null, productSearchLike]
@@ -613,7 +632,7 @@ async function api(req, res) {
     }
     const productTrend = selectedSku ? await query(
       `SELECT to_char(months.month_start, 'YYYY-MM') AS mes,
-              COALESCE(SUM(p.quantidade_solicitada), 0)::int AS total
+              COALESCE(SUM(COALESCE(NULLIF(p.quantidade_liberada, 0), p.quantidade_solicitada)), 0)::int AS total
        FROM generate_series(
          date_trunc('month', CURRENT_DATE) - INTERVAL '5 months',
          date_trunc('month', CURRENT_DATE),
@@ -621,7 +640,12 @@ async function api(req, res) {
        ) AS months(month_start)
        LEFT JOIN pedidos p
          ON p.sku_produto = $1
-        AND date_trunc('month', p.data_hora) = months.month_start
+        AND (CASE
+               WHEN p.status = 'Liberado' THEN 'Finalizado'
+               WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
+               ELSE p.status
+             END) = 'Finalizado'
+        AND date_trunc('month', COALESCE(p.retirada_em, p.liberado_em, p.data_hora)) = months.month_start
        GROUP BY months.month_start
        ORDER BY months.month_start`,
       [selectedSku]
@@ -658,6 +682,15 @@ async function api(req, res) {
          ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor`,
         [hashPassword(nextPassword)]
       );
+    }
+    for (const key of ["omie_app_key", "omie_app_secret"]) {
+      if (body[key] !== undefined) {
+        await query(
+          `INSERT INTO configuracoes (chave, valor) VALUES ($1, $2)
+           ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor`,
+          [key, normalizeText(body[key], 300)]
+        );
+      }
     }
     return send(res, 200, { ok: true });
   }

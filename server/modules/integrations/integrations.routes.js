@@ -1,275 +1,252 @@
-import { asInt, query } from "../../db.js";
+import { query, tx } from "../../db.js";
 import { normalizeText, readBody, send } from "../../utils/http.js";
-import {
-  enqueueIntegrationJob,
-  getIntegration,
-  getIntegrationSecrets,
-  listIntegrations,
-  saveIntegration,
-  updateIntegrationStatus
-} from "../../services/integrations/integration.service.js";
-import { normalizeSyncScope, processIntegrationJob, processNextIntegrationJob, testOmieConnection } from "../../services/integrations/omie/omie.sync.js";
-import { handleIntegrationEvents } from "../../services/integrations/integration.events.js";
-import { runOmieSchedulerTick } from "../../services/integrations/omie/omie.scheduler.js";
+import { handleIntegrationEvents, publishIntegrationEvent } from "../../services/integrations/integration.events.js";
+import { decryptSecret, encryptSecret, maskSecret, sanitizeIntegration } from "../../services/integrations/integration.security.js";
+import { normalizePriority } from "../../services/integrations/integration.service.js";
+import { normalizeSyncScope, enqueueIntegrationJob, processIntegrationJobById, processNextIntegrationJob } from "../../services/integrations/omie/omie.sync.js";
 
-export async function handleIntegrationWebhookRoutes(req, res, context) {
-  const { method, url } = context;
-  if (url.pathname !== "/api/webhooks/omie" || method !== "POST") return false;
+function requireAdmin(req, res, context) {
+  return context.requireUser(req, res, "admin");
+}
 
-  const integrationId = asInt(url.searchParams.get("integrationId"));
-  const receivedSecret = normalizeText(req.headers["x-acpark-webhook-secret"] || url.searchParams.get("secret"), 500);
-  const loaded = await getIntegrationSecrets(integrationId);
-  if (!loaded || loaded.integration.provedor !== "OMIE" || !loaded.integration.ativo) {
-    return send(res, 404, { error: "Integracao nao encontrada." }), true;
-  }
-  const expectedSecret = normalizeText(loaded.secrets.webhook_secret, 500);
-  const valid = Boolean(expectedSecret && receivedSecret && expectedSecret === receivedSecret);
-  const body = await readBody(req);
-  const eventType = normalizeText(body.evento || body.event_type || body.tipo || "OMIE_EVENT", 120);
-  const inserted = await query(
-    `INSERT INTO integration_webhooks
-       (integration_id, provider, event_type, signature_valid, raw_payload, headers, status, processing_error)
-     VALUES ($1, 'OMIE', $2, $3, $4::jsonb, $5::jsonb, $6, $7)
-     RETURNING id`,
-    [
-      loaded.integration.id,
-      eventType,
-      valid,
-      JSON.stringify(body || {}),
-      JSON.stringify({
-        "user-agent": req.headers["user-agent"] || "",
-        "x-forwarded-for": req.headers["x-forwarded-for"] || ""
-      }),
-      valid ? "RECEBIDO" : "RECUSADO",
-      valid ? null : "Webhook secret invalido."
-    ]
-  );
-  if (!valid) return send(res, 401, { error: "Webhook invalido." }), true;
-
-  await enqueueIntegrationJob({
-    integrationId: loaded.integration.id,
-    jobType: "WEBHOOK_OMIE",
-    payload: { webhook_id: inserted[0].id, event_type: eventType },
-    idempotencyKey: `OMIE-WEBHOOK-${inserted[0].id}`
-  });
-  return send(res, 202, { ok: true }), true;
+export async function handleIntegrationWebhookRoutes(req, res) {
+  return false;
 }
 
 export async function handleIntegrationsRoutes(req, res, context) {
-  const { method, requireUser, url, user } = context;
+  const { method, url } = context;
 
-  if (url.pathname === "/api/admin/integrations/events" && method === "GET") {
-    if (!requireUser(req, res, "admin")) return true;
+  if (url.pathname === "/api/admin/integrations/events") {
+    if (!requireAdmin(req, res, context)) return true;
     handleIntegrationEvents(req, res);
     return true;
   }
 
-  if (url.pathname === "/api/admin/integrations") {
-    if (!requireUser(req, res, "admin")) return true;
-    if (method === "GET") return send(res, 200, { integrations: await listIntegrations() }), true;
-    if (method === "POST") {
-      const body = await readBody(req);
-      const saved = await saveIntegration(body, user.name || "admin");
-      return send(res, 200, { integration: await getIntegration(saved.id) }), true;
-    }
+  if (url.pathname === "/api/admin/integrations/health") {
+    if (!requireAdmin(req, res, context)) return true;
+    const runtime = await query("SELECT * FROM integration_runtime_state ORDER BY updated_at DESC LIMIT 20").catch(() => []);
+    return send(res, 200, { ok: true, runtime }), true;
+  }
+
+  if (url.pathname === "/api/admin/integrations" && method === "GET") {
+    if (!requireAdmin(req, res, context)) return true;
+    const integrations = await query("SELECT * FROM integrations ORDER BY provedor, nome");
+    const credentials = await query("SELECT integration_id, credential_key, masked_value, encrypted_value FROM integration_credentials");
+    return send(res, 200, {
+      integrations: integrations.map((integration) => sanitizeIntegration(
+        integration,
+        credentials.filter((credential) => credential.integration_id === integration.id)
+      ))
+    }), true;
+  }
+
+  if (url.pathname === "/api/admin/integrations" && method === "POST") {
+    if (!requireAdmin(req, res, context)) return true;
+    const body = await readBody(req);
+    const result = await tx(async (client) => {
+      const values = {
+        id: Number(body.id || 0),
+        nome: normalizeText(body.nome || "OMIE", 120),
+        provedor: normalizeText(body.provedor || "OMIE", 40),
+        tipo: normalizeText(body.tipo || "ERP_ESTOQUE", 40),
+        ambiente: normalizeText(body.ambiente || "PRODUCAO", 40),
+        urlBase: normalizeText(body.url_base || "https://app.omie.com.br/api/v1", 255),
+        empresaVinculada: normalizeText(body.empresa_vinculada || "", 160) || null,
+        ativo: body.ativo !== false,
+        stockMode: normalizeText(body.stock_mode || "MANUAL", 30)
+      };
+      const existing = values.id
+        ? await client.query("SELECT id FROM integrations WHERE id = $1 LIMIT 1", [values.id])
+        : await client.query(
+          "SELECT id FROM integrations WHERE provedor = $1 AND ambiente = $2 ORDER BY id LIMIT 1",
+          [values.provedor, values.ambiente]
+        );
+      const integration = existing.rows[0]
+        ? await client.query(
+          `UPDATE integrations
+           SET nome = $2,
+               provedor = $3,
+               tipo = $4,
+               ambiente = $5,
+               url_base = $6,
+               empresa_vinculada = $7,
+               ativo = $8,
+               stock_mode = $9,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1
+           RETURNING *`,
+          [
+            existing.rows[0].id,
+            values.nome,
+            values.provedor,
+            values.tipo,
+            values.ambiente,
+            values.urlBase,
+            values.empresaVinculada,
+            values.ativo,
+            values.stockMode
+          ]
+        )
+        : await client.query(
+          `INSERT INTO integrations (nome, provedor, tipo, ambiente, url_base, empresa_vinculada, ativo, status, stock_mode)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDENTE', $8)
+           RETURNING *`,
+          [
+            values.nome,
+            values.provedor,
+            values.tipo,
+            values.ambiente,
+            values.urlBase,
+            values.empresaVinculada,
+            values.ativo,
+            values.stockMode
+          ]
+        );
+      const row = integration.rows[0];
+      for (const key of ["app_key", "app_secret"]) {
+        if (body[key]) {
+          const credential = await client.query(
+            "SELECT id FROM integration_credentials WHERE integration_id = $1 AND credential_key = $2 ORDER BY id LIMIT 1",
+            [row.id, key]
+          );
+          if (credential.rows[0]) {
+            await client.query(
+              `UPDATE integration_credentials
+               SET encrypted_value = $2,
+                   masked_value = $3,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = $1`,
+              [credential.rows[0].id, encryptSecret(body[key]), maskSecret(body[key])]
+            );
+          } else {
+            await client.query(
+              `INSERT INTO integration_credentials (integration_id, credential_key, encrypted_value, masked_value)
+               VALUES ($1, $2, $3, $4)`,
+              [row.id, key, encryptSecret(body[key]), maskSecret(body[key])]
+            );
+          }
+        }
+      }
+      return row;
+    });
+    publishIntegrationEvent("integration.updated", { id: result.id });
+    return send(res, 200, { ok: true, integration: sanitizeIntegration(result) }), true;
   }
 
   if (url.pathname === "/api/admin/integrations/test" && method === "POST") {
-    if (!requireUser(req, res, "admin")) return true;
+    if (!requireAdmin(req, res, context)) return true;
     const body = await readBody(req);
-    const loaded = await getIntegrationSecrets(body.id);
-    if (!loaded) return send(res, 404, { error: "Integracao nao encontrada." }), true;
-    const result = await testOmieConnection(loaded.integration.id, user.name || "admin");
-    return send(res, result.status === "CONECTADO" ? 200 : 400, { ok: result.status === "CONECTADO", ...result }), true;
+    const id = Number(body.id || 0);
+    if (!id) return send(res, 400, { error: "Integração inválida." }), true;
+    const integrationRows = await query("SELECT * FROM integrations WHERE id = $1", [id]);
+    const integration = integrationRows[0];
+    if (!integration) return send(res, 404, { error: "Integração não encontrada." }), true;
+    const credentialRows = await query(
+      "SELECT credential_key, encrypted_value FROM integration_credentials WHERE integration_id = $1",
+      [id]
+    );
+    const secrets = Object.fromEntries(credentialRows.map((row) => [
+      row.credential_key,
+      decryptSecret(row.encrypted_value)
+    ]));
+    if (!secrets.app_key || !secrets.app_secret) {
+      return send(res, 400, { error: "Configure App key e App secret antes de testar." }), true;
+    }
+    await query(
+      `UPDATE integrations
+       SET status = 'CREDENCIAIS_CONFIGURADAS',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [id]
+    );
+    return send(res, 200, {
+      ok: true,
+      status: "CREDENCIAIS_CONFIGURADAS",
+      message: "Credenciais configuradas. A sincronização real será executada pela fila OMIE."
+    }), true;
+  }
+
+  if (url.pathname === "/api/admin/integrations/jobs") {
+    if (!requireAdmin(req, res, context)) return true;
+    const jobs = await query(
+      `SELECT * FROM integration_jobs
+       ORDER BY priority_rank DESC, created_at DESC
+       LIMIT 200`
+    ).catch(() => []);
+    return send(res, 200, { jobs }), true;
   }
 
   if (url.pathname === "/api/admin/integrations/sync" && method === "POST") {
-    if (!requireUser(req, res, "admin")) return true;
+    if (!requireAdmin(req, res, context)) return true;
     const body = await readBody(req);
-    const integration = await getIntegration(body.id);
-    if (!integration) return send(res, 404, { error: "Integracao nao encontrada." }), true;
-    const jobType = normalizeSyncScope(body.escopo || body.scope || body.job_type);
-    const job = await enqueueIntegrationJob({
-      integrationId: integration.id,
-      jobType,
-      payload: { origem: "admin", escopo: jobType },
-      idempotencyKey: `${jobType}-${integration.id}-${Date.now()}`
-    });
-    await updateIntegrationStatus(integration.id, "AGUARDANDO_OMIE", "", user.name || "admin");
-    return send(res, 202, { ok: true, job }), true;
-  }
-
-  if (url.pathname === "/api/admin/integrations/jobs" && method === "GET") {
-    if (!requireUser(req, res, "admin")) return true;
-    const integrationId = asInt(url.searchParams.get("integrationId"));
-    const rows = await query(
-      `SELECT j.id, j.integration_id, i.nome AS integration_name, j.job_type, j.status, j.attempts,
-              j.current_page, j.cursor, j.last_external_id, j.last_processed_at,
-              j.next_run_at, j.last_error, j.result, j.created_at, j.updated_at, j.completed_at
-       FROM integration_jobs j
-       LEFT JOIN integrations i ON i.id = j.integration_id
-       WHERE ($1::bigint = 0 OR j.integration_id = $1)
-       ORDER BY j.created_at DESC
-       LIMIT 300`,
-      [integrationId]
-    );
-    return send(res, 200, { jobs: rows }), true;
+    const id = Number(body.id || 0);
+    if (!id) return send(res, 400, { error: "Integração inválida." }), true;
+    const job = await tx((client) => enqueueIntegrationJob(client, {
+      integrationId: id,
+      jobType: normalizeSyncScope(body.escopo || body.scope),
+      priority: normalizePriority(body.priority || "ALTA")
+    }));
+    publishIntegrationEvent("job.created", { id: job.id });
+    return send(res, 200, { ok: true, job }), true;
   }
 
   if (url.pathname === "/api/admin/integrations/jobs/process-next" && method === "POST") {
-    if (!requireUser(req, res, "admin")) return true;
-    const result = await processNextIntegrationJob(user.name || "admin");
-    return send(res, 200, { ok: true, job: result }), true;
-  }
-
-  if (url.pathname === "/api/admin/integrations/scheduler/tick" && method === "POST") {
-    if (!requireUser(req, res, "admin")) return true;
-    const result = await runOmieSchedulerTick({ actor: user.name || "admin" });
-    return send(res, 200, { ok: true, ...result }), true;
-  }
-
-  if (url.pathname === "/api/admin/integrations/health") {
-    if (!requireUser(req, res, "admin")) return true;
-    const integrationId = asInt(url.searchParams.get("integrationId"));
-    const [summary] = await query(
-      `SELECT
-         COUNT(*) FILTER (WHERE j.status IN ('PENDENTE', 'PROCESSANDO', 'ERRO_TEMPORARIO'))::int AS jobs_pendentes,
-         COUNT(*) FILTER (WHERE j.status LIKE 'ERRO%')::int AS jobs_com_erro
-       FROM integration_jobs j
-       WHERE ($1::bigint = 0 OR j.integration_id = $1)`,
-      [integrationId]
-    );
-    const metrics = await query(
-      `SELECT metric_name, AVG(metric_value)::numeric(12,2) AS media, MAX(metric_value)::numeric(12,2) AS maximo, COUNT(*)::int AS total
-       FROM integration_metrics
-       WHERE ($1::bigint = 0 OR integration_id = $1)
-         AND recorded_at >= CURRENT_TIMESTAMP - INTERVAL '1 hour'
-       GROUP BY metric_name
-       ORDER BY metric_name`,
-      [integrationId]
-    );
-    const runtime = await query(
-      `SELECT r.*, i.nome
-       FROM integration_runtime_state r
-       JOIN integrations i ON i.id = r.integration_id
-       WHERE ($1::bigint = 0 OR r.integration_id = $1)
-       ORDER BY i.nome`,
-      [integrationId]
-    );
-    const stale = await query(
-      `SELECT COUNT(*)::int AS total
-       FROM estoque_pdv
-       WHERE ultima_sincronizacao IS NOT NULL
-         AND ultima_sincronizacao < CURRENT_TIMESTAMP - INTERVAL '5 minutes'`
-    );
-    return send(res, 200, { summary: summary || {}, metrics, runtime, stale_stock_items: stale[0]?.total || 0 }), true;
+    if (!requireAdmin(req, res, context)) return true;
+    const job = await tx((client) => processNextIntegrationJob(client));
+    return send(res, 200, { ok: true, job }), true;
   }
 
   if (url.pathname === "/api/admin/integrations/jobs/process" && method === "POST") {
-    if (!requireUser(req, res, "admin")) return true;
+    if (!requireAdmin(req, res, context)) return true;
     const body = await readBody(req);
-    const result = await processIntegrationJob(body.id, user.name || "admin");
-    return send(res, 200, { ok: true, job: result }), true;
-  }
-
-  if (url.pathname === "/api/admin/integrations/locations") {
-    if (!requireUser(req, res, "admin")) return true;
-    const integrationId = asInt(url.searchParams.get("integrationId"));
-    const rows = await query(
-      `SELECT id, integration_id, omie_location_id, code, name, description, active, company, synced_at
-       FROM omie_stock_locations
-       WHERE ($1::bigint = 0 OR integration_id = $1)
-       ORDER BY active DESC, name`,
-      [integrationId]
-    );
-    return send(res, 200, { locations: rows }), true;
+    const id = Number(body.id || 0);
+    if (!id) return send(res, 400, { error: "Job inválido." }), true;
+    const job = await tx((client) => processIntegrationJobById(client, id));
+    if (!job) return send(res, 404, { error: "Job não encontrado ou já processado." }), true;
+    publishIntegrationEvent("job.updated", { id: job.id, status: job.status });
+    return send(res, 200, { ok: true, job }), true;
   }
 
   if (url.pathname === "/api/admin/integrations/location-mappings") {
-    if (!requireUser(req, res, "admin")) return true;
+    if (!requireAdmin(req, res, context)) return true;
     if (method === "GET") {
-      const rows = await query(
+      const mappings = await query(
         `SELECT m.*, p.nome AS pdv_nome
          FROM pdv_stock_location_mappings m
-         JOIN pdvs p ON p.id = m.pdv_acpark_id
+         LEFT JOIN pdvs p ON p.id = m.pdv_acpark_id
          ORDER BY p.nome`
-      );
-      return send(res, 200, { mappings: rows }), true;
+      ).catch(() => []);
+      return send(res, 200, { mappings }), true;
     }
     if (method === "POST") {
       const body = await readBody(req);
-      const location = await query(
-        `SELECT omie_location_id, name, active
-         FROM omie_stock_locations
-         WHERE integration_id = $1 AND omie_location_id = $2
-         LIMIT 1`,
-        [asInt(body.integration_id), normalizeText(body.omie_location_id, 80)]
-      );
-      if (!location[0] || !location[0].active) return send(res, 400, { error: "Local OMIE invalido ou inativo." }), true;
-      const saved = await query(
-        `INSERT INTO pdv_stock_location_mappings
-           (pdv_acpark_id, integration_id, omie_location_id, omie_location_name, active)
-         VALUES ($1, $2, $3, $4, TRUE)
-         ON CONFLICT (pdv_acpark_id, integration_id, omie_location_id)
-         DO UPDATE SET omie_location_name = EXCLUDED.omie_location_name,
-                       active = TRUE,
-                       updated_at = CURRENT_TIMESTAMP
-         RETURNING *`,
-        [asInt(body.pdv_acpark_id), asInt(body.integration_id), location[0].omie_location_id, location[0].name]
-      );
       await query(
-        `INSERT INTO integration_audit_logs (integration_id, action, actor, details)
-         VALUES ($1, 'PDV_LOCATION_MAPPING_UPDATED', $2, $3::jsonb)`,
-        [asInt(body.integration_id), user.name || "admin", JSON.stringify({ pdv_acpark_id: asInt(body.pdv_acpark_id), omie_location_id: location[0].omie_location_id })]
+        `INSERT INTO pdv_stock_location_mappings (integration_id, pdv_acpark_id, omie_location_id, omie_location_name, active)
+         VALUES ($1, $2, $3, $4, TRUE)
+         ON CONFLICT (integration_id, pdv_acpark_id) DO UPDATE
+         SET omie_location_id = EXCLUDED.omie_location_id,
+             omie_location_name = EXCLUDED.omie_location_name,
+             active = TRUE,
+             updated_at = CURRENT_TIMESTAMP`,
+        [
+          Number(body.integration_id || body.id),
+          Number(body.pdv_id || body.pdv_acpark_id),
+          normalizeText(body.omie_location_id, 80),
+          normalizeText(body.omie_location_name || "", 120)
+        ]
       );
-      return send(res, 200, { mapping: saved[0] }), true;
+      return send(res, 200, { ok: true }), true;
     }
   }
 
   if (url.pathname === "/api/admin/integrations/reconciliations") {
-    if (!requireUser(req, res, "admin")) return true;
-    const integrationId = asInt(url.searchParams.get("integrationId"));
-    const rows = await query(
-      `SELECT ri.*, p.nome AS produto_nome, pdv.nome AS pdv_nome
-       FROM stock_reconciliation_items ri
-       LEFT JOIN produtos p ON p.sku = ri.sku_produto
-       LEFT JOIN pdvs pdv ON pdv.id = ri.pdv_id
-       WHERE ($1::bigint = 0 OR ri.integration_id = $1)
-       ORDER BY ri.created_at DESC
-       LIMIT 300`,
-      [integrationId]
-    );
-    return send(res, 200, { divergences: rows }), true;
-  }
-
-  if (url.pathname === "/api/admin/integrations/reconciliations/review" && method === "POST") {
-    if (!requireUser(req, res, "admin")) return true;
-    const body = await readBody(req);
-    const rows = await query(
-      `UPDATE stock_reconciliation_items
-       SET status = 'REVISADO',
-           reviewed_by = $2,
-           reviewed_at = CURRENT_TIMESTAMP,
-           note = $3
-       WHERE id = $1
-       RETURNING *`,
-      [asInt(body.id), user.name || "admin", normalizeText(body.note, 500)]
-    );
-    return send(res, 200, { divergence: rows[0] || null }), true;
-  }
-
-  if (url.pathname === "/api/admin/integrations/audit") {
-    if (!requireUser(req, res, "admin")) return true;
-    const integrationId = asInt(url.searchParams.get("integrationId"));
-    const rows = await query(
-      `SELECT id, integration_id, action, actor, details, created_at
-       FROM integration_audit_logs
-       WHERE ($1::bigint = 0 OR integration_id = $1)
+    if (!requireAdmin(req, res, context)) return true;
+    const divergences = await query(
+      `SELECT * FROM stock_reconciliation_items
        ORDER BY created_at DESC
-       LIMIT 300`,
-      [integrationId]
-    );
-    return send(res, 200, { audit: rows }), true;
+       LIMIT 200`
+    ).catch(() => []);
+    return send(res, 200, { divergences }), true;
   }
 
   return false;

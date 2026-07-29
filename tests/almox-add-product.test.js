@@ -22,6 +22,7 @@ test("schema and backend support almox-origin order items", () => {
   assert.match(routes, /Remova produtos duplicados antes de adicionar ao pedido/);
   assert.match(routes, /item_origem\)/);
   assert.match(routes, /'ALMOX'/);
+  assert.match(routes, /COALESCE\(p\.item_origem, 'PDV'\) AS item_origem/);
 });
 
 test("admin can add product only while order is in progress", () => {
