@@ -4126,7 +4126,7 @@ async function viewOmieIntegrations(filters = {}) {
         <label class="field-select">Status
           <select name="status">
             <option value="" ${!status ? "selected" : ""}>Todos</option>
-            ${["PENDING", "PROCESSING", "SUCCESS", "FAILED", "RETRY_REQUIRED"].map((item) => `<option value="${item}" ${status === item ? "selected" : ""}>${item}</option>`).join("")}
+            ${["PENDENTE", "PROCESSANDO", "CONCLUIDO", "ERRO_TEMPORARIO", "ERRO_AUTENTICACAO", "AGUARDANDO_REPROCESSAMENTO"].map((item) => `<option value="${item}" ${status === item ? "selected" : ""}>${item}</option>`).join("")}
           </select>
         </label>
         <label class="field-select">Tipo
@@ -4293,8 +4293,17 @@ async function viewOmieIntegrations(filters = {}) {
   }));
   document.querySelectorAll(".sync-integration").forEach((button) => button.addEventListener("click", async () => {
     const scope = document.querySelector(`.sync-scope[data-id="${button.dataset.id}"]`)?.value || "COMPLETA";
-    await request("/api/admin/integrations/sync", { method: "POST", body: JSON.stringify({ id: button.dataset.id, escopo: scope }) });
-    toast("Sincronização colocada na fila.");
+    button.disabled = true;
+    try {
+      const response = await request("/api/admin/integrations/sync", { method: "POST", body: JSON.stringify({ id: button.dataset.id, escopo: scope }) });
+      if (response.job?.status === "CONCLUIDO") {
+        toast("Sincronização processada.");
+      } else {
+        toast(response.job?.last_error || "Sincronização registrada com alerta.", "error");
+      }
+    } finally {
+      button.disabled = false;
+    }
     await viewOmieIntegrations({ status, type, from, to, entityId });
   }));
   document.querySelector(".process-next-integration-job")?.addEventListener("click", async () => {

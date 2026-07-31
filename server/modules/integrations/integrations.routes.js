@@ -206,8 +206,9 @@ export async function handleIntegrationsRoutes(req, res, context) {
       jobType: normalizeSyncScope(body.escopo || body.scope),
       priority: normalizePriority(body.priority || "ALTA")
     }));
-    publishIntegrationEvent("job.created", { id: job.id });
-    return send(res, 200, { ok: true, job }), true;
+    const processed = await tx((client) => processIntegrationJobById(client, job.id));
+    publishIntegrationEvent("job.updated", { id: job.id, status: processed?.status || job.status });
+    return send(res, 200, { ok: true, job: processed || job }), true;
   }
 
   if (url.pathname === "/api/admin/integrations/jobs/process-next" && method === "POST") {

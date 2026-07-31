@@ -30,6 +30,19 @@ export async function enqueueIntegrationJob(client, {
 }) {
   const normalizedType = normalizeSyncScope(jobType);
   const rank = priorityRank(priority);
+  const existing = await client.query(
+    `SELECT *
+     FROM integration_jobs
+     WHERE integration_id = $1
+       AND job_type = $2
+       AND payload = $3::jsonb
+       AND status IN ('PENDENTE', 'PROCESSANDO', 'REPROCESSAMENTO', 'ERRO_TEMPORARIO', 'AGUARDANDO_REPROCESSAMENTO')
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [integrationId, normalizedType, JSON.stringify(payload)]
+  );
+  if (existing.rows[0]) return existing.rows[0];
+
   let result;
   try {
     result = await client.query(
@@ -63,7 +76,7 @@ export async function processNextIntegrationJob(client) {
   const result = await client.query(
     `SELECT *
      FROM integration_jobs
-     WHERE status IN ('PENDENTE', 'PROCESSANDO', 'REPROCESSAMENTO', 'ERRO_TEMPORARIO', 'AGUARDANDO_REPROCESSAMENTO', 'ERRO_DADOS')
+     WHERE status IN ('PENDENTE', 'REPROCESSAMENTO', 'ERRO_TEMPORARIO', 'AGUARDANDO_REPROCESSAMENTO')
      ORDER BY priority_rank DESC, created_at
      LIMIT 1
      FOR UPDATE SKIP LOCKED`
@@ -79,7 +92,8 @@ export async function processNextIntegrationJob(client) {
     return { ...job, status: "CONCLUIDO", result: processed.result };
   } catch (error) {
     await markIntegrationJobFailed(client, job.id, error);
-    throw error;
+    const failed = await getIntegrationJobById(client, job.id);
+    return failed || { ...job, status: "ERRO_TEMPORARIO", last_error: safeErrorMessage(error) };
   }
 }
 
@@ -104,7 +118,8 @@ export async function processIntegrationJobById(client, id) {
     return { ...job, status: "CONCLUIDO", result: processed.result };
   } catch (error) {
     await markIntegrationJobFailed(client, job.id, error);
-    throw error;
+    const failed = await getIntegrationJobById(client, job.id);
+    return failed || { ...job, status: "ERRO_TEMPORARIO", last_error: safeErrorMessage(error) };
   }
 }
 
@@ -191,7 +206,7 @@ async function markIntegrationJobCompleted(client, id, result = null) {
 }
 
 async function markIntegrationJobFailed(client, id, error) {
-  const message = String(error?.message || error || "Falha ao processar job OMIE.").slice(0, 1000);
+  const message = safeErrorMessage(error);
   const credentialError = /credenciais|authenticate|autentic/i.test(message);
   const status = credentialError ? "ERRO_AUTENTICACAO" : "ERRO_TEMPORARIO";
   await client.query(
@@ -212,6 +227,15 @@ async function markIntegrationJobFailed(client, id, error) {
      )`,
     [id, status, message]
   ).catch(() => {});
+}
+
+async function getIntegrationJobById(client, id) {
+  const result = await client.query("SELECT * FROM integration_jobs WHERE id = $1 LIMIT 1", [id]);
+  return result.rows[0] || null;
+}
+
+function safeErrorMessage(error) {
+  return String(error?.message || error || "Falha ao processar job OMIE.").slice(0, 1000);
 }
 
 async function markSyncStateSuccess(client, integrationId, scope) {
