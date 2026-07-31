@@ -245,7 +245,7 @@ async function markSyncStateSuccess(client, integrationId, scope) {
   if (hasUpdatedAt) {
     await client.query(
       `UPDATE integration_sync_state
-       SET last_success_at = COALESCE(last_success_at, CURRENT_TIMESTAMP),
+       SET last_success_at = CURRENT_TIMESTAMP,
            updated_at = CURRENT_TIMESTAMP
        WHERE integration_id = $1 AND scope = $2`,
       [integrationId, scope]
@@ -254,7 +254,7 @@ async function markSyncStateSuccess(client, integrationId, scope) {
   }
   await client.query(
     `UPDATE integration_sync_state
-     SET last_success_at = COALESCE(last_success_at, CURRENT_TIMESTAMP)
+     SET last_success_at = CURRENT_TIMESTAMP
      WHERE integration_id = $1 AND scope = $2`,
     [integrationId, scope]
   );
@@ -264,6 +264,7 @@ async function markIntegrationSuccess(client, integrationId) {
   await client.query(
     `UPDATE integrations
      SET status = 'CONECTADO',
+         ultima_sincronizacao = CURRENT_TIMESTAMP,
          last_error = NULL,
          updated_at = CURRENT_TIMESTAMP
      WHERE id = $1`,
