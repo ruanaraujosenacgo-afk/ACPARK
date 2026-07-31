@@ -49,6 +49,11 @@ export function sanitizeIntegration(integration = {}, credentials = []) {
     status: integration.status,
     url_base: integration.url_base,
     stock_mode: integration.stock_mode,
+    empresa_vinculada: integration.empresa_vinculada,
+    ultima_sincronizacao: integration.ultima_sincronizacao,
+    last_connection_test_at: integration.last_connection_test_at,
+    last_connection_duration_ms: integration.last_connection_duration_ms,
+    last_error: integration.last_error,
     created_at: integration.created_at,
     updated_at: integration.updated_at,
     credentials: credentials.map((credential) => ({

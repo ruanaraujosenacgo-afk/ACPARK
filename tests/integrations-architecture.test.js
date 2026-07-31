@@ -43,10 +43,27 @@ test("credenciais de integracao sao criptografadas, mascaradas e sanitizadas", (
   assert.equal(maskSecret("abcdefghi"), "abc***ghi");
 
   const sanitized = sanitizeIntegration(
-    { id: 1, nome: "OMIE", provedor: "OMIE", tipo: "ERP_ESTOQUE", ambiente: "PRODUCAO", ativo: true, status: "PENDENTE" },
+    {
+      id: 1,
+      nome: "OMIE",
+      provedor: "OMIE",
+      tipo: "ERP_ESTOQUE",
+      ambiente: "PRODUCAO",
+      ativo: true,
+      status: "PENDENTE",
+      empresa_vinculada: "AGUAS CORRENTES PARK",
+      ultima_sincronizacao: "2026-07-31 09:53:34",
+      last_connection_test_at: "2026-07-31 09:01:32",
+      last_connection_duration_ms: 123,
+      last_error: null
+    },
     [{ credential_key: "app_secret", masked_value: "abc***ghi", encrypted_value: encrypted }]
   );
   assert.deepEqual(sanitized.credentials, [{ key: "app_secret", masked_value: "abc***ghi", configured: true }]);
+  assert.equal(sanitized.empresa_vinculada, "AGUAS CORRENTES PARK");
+  assert.equal(sanitized.ultima_sincronizacao, "2026-07-31 09:53:34");
+  assert.equal(sanitized.last_connection_test_at, "2026-07-31 09:01:32");
+  assert.equal(sanitized.last_connection_duration_ms, 123);
   assert.equal(JSON.stringify(sanitized).includes("super-secret"), false);
   assert.equal(JSON.stringify(sanitized).includes(encrypted), false);
 });
