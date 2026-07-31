@@ -88,8 +88,9 @@ export async function processNextIntegrationJob(client) {
     const processed = await processIntegrationJob(client, job);
     await markSyncStateSuccess(client, job.integration_id, job.job_type);
     await markIntegrationSuccess(client, job.integration_id);
-    await markIntegrationJobCompleted(client, job.id, processed.result);
-    return { ...job, status: "CONCLUIDO", result: processed.result };
+    const status = getCompletedJobStatus(processed.result);
+    await markIntegrationJobCompleted(client, job.id, processed.result, status);
+    return { ...job, status, result: processed.result };
   } catch (error) {
     await markIntegrationJobFailed(client, job.id, error);
     const failed = await getIntegrationJobById(client, job.id);
@@ -114,8 +115,9 @@ export async function processIntegrationJobById(client, id) {
     const processed = await processIntegrationJob(client, job);
     await markSyncStateSuccess(client, job.integration_id, job.job_type);
     await markIntegrationSuccess(client, job.integration_id);
-    await markIntegrationJobCompleted(client, job.id, processed.result);
-    return { ...job, status: "CONCLUIDO", result: processed.result };
+    const status = getCompletedJobStatus(processed.result);
+    await markIntegrationJobCompleted(client, job.id, processed.result, status);
+    return { ...job, status, result: processed.result };
   } catch (error) {
     await markIntegrationJobFailed(client, job.id, error);
     const failed = await getIntegrationJobById(client, job.id);
@@ -188,21 +190,25 @@ async function markIntegrationJobProcessing(client, id) {
   await client.query("UPDATE integration_jobs SET status = 'PROCESSANDO' WHERE id = $1", [id]);
 }
 
-async function markIntegrationJobCompleted(client, id, result = null) {
+function getCompletedJobStatus(result = {}) {
+  return result?.warning ? "CONCLUIDO_COM_ALERTAS" : "CONCLUIDO";
+}
+
+async function markIntegrationJobCompleted(client, id, result = null, status = "CONCLUIDO") {
   if (await hasColumn(client, "integration_jobs", "completed_at")) {
     await client.query(
       `UPDATE integration_jobs
-       SET status = 'CONCLUIDO',
+       SET status = $3,
            completed_at = CURRENT_TIMESTAMP,
            result = COALESCE($2::jsonb, result),
-           last_error = NULL,
+           last_error = $4,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $1`,
-      [id, result ? JSON.stringify(result) : null]
+      [id, result ? JSON.stringify(result) : null, status, result?.warning || null]
     );
     return;
   }
-  await client.query("UPDATE integration_jobs SET status = 'CONCLUIDO' WHERE id = $1", [id]);
+  await client.query("UPDATE integration_jobs SET status = $2 WHERE id = $1", [id, status]);
 }
 
 async function markIntegrationJobFailed(client, id, error) {

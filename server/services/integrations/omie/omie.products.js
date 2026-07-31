@@ -3,6 +3,21 @@ import { mapOmieProduct } from "./omie.mappers.js";
 
 const PRODUCTS_ENDPOINT = "/geral/produtos/";
 const PRODUCTS_CALL = "ListarProdutos";
+const PRODUCT_LIST_FIELDS = ["produto_servico_cadastro"];
+const PRODUCT_QUERY_MODES = [
+  {
+    mode: "padrao",
+    params: { apenas_importado_api: "N", filtrar_apenas_omiepdv: "N" }
+  },
+  {
+    mode: "sem_filtros_opcionais",
+    params: {}
+  },
+  {
+    mode: "somente_importados_api",
+    params: { apenas_importado_api: "S", filtrar_apenas_omiepdv: "N" }
+  }
+];
 
 function asPositiveInt(value, fallback) {
   const parsed = Number.parseInt(value, 10);
@@ -149,7 +164,29 @@ export async function testOmieProductsConnection({ loaded, fetchImpl }) {
     duration_ms: response.duration_ms,
     page: response.data?.pagina || 1,
     total_pages: response.data?.total_de_paginas || 0,
-    total_records: response.data?.total_de_registros || response.data?.total_de_registros_encontrados || 0
+    total_records: response.data?.total_de_registros || response.data?.total_de_registros_encontrados || 0,
+    products_received: getOmieProductsFromResponse(response.data).length,
+    response_keys: Object.keys(response.data || {}).filter((key) => !/secret|token|key/i.test(key)).slice(0, 20)
+  };
+}
+
+function getOmieProductsFromResponse(data = {}) {
+  for (const field of PRODUCT_LIST_FIELDS) {
+    if (Array.isArray(data?.[field])) return data[field];
+  }
+  return [];
+}
+
+function describeOmieResponse(data = {}) {
+  return {
+    page: data?.pagina || 1,
+    total_pages: data?.total_de_paginas || 0,
+    total_records: data?.total_de_registros || data?.total_de_registros_encontrados || 0,
+    response_keys: Object.keys(data || {}).filter((key) => !/secret|token|key/i.test(key)).slice(0, 20),
+    array_fields: Object.entries(data || {})
+      .filter(([, value]) => Array.isArray(value))
+      .map(([key, value]) => ({ field: key, count: value.length }))
+      .slice(0, 20)
   };
 }
 
@@ -165,29 +202,45 @@ export async function syncOmieProducts(client, { loaded, payload = {}, fetchImpl
     ignored: 0,
     inactive: 0,
     next_page: null,
-    total_pages: null
+    total_pages: null,
+    total_records: 0,
+    query_mode: null,
+    diagnostics: []
   };
 
   let page = firstPage;
   for (let processed = 0; processed < maxPages; processed += 1) {
-    const response = await omieRequestWithConfig({
-      loaded,
-      endpoint: PRODUCTS_ENDPOINT,
-      call: PRODUCTS_CALL,
-      params: {
-        pagina: page,
-        registros_por_pagina: pageSize,
-        apenas_importado_api: "N",
-        filtrar_apenas_omiepdv: "N"
-      },
-      fetchImpl
-    });
+    let selectedResponse = null;
+    let selectedProducts = [];
+    for (const queryMode of PRODUCT_QUERY_MODES) {
+      const response = await omieRequestWithConfig({
+        loaded,
+        endpoint: PRODUCTS_ENDPOINT,
+        call: PRODUCTS_CALL,
+        params: {
+          pagina: page,
+          registros_por_pagina: pageSize,
+          ...queryMode.params
+        },
+        fetchImpl
+      });
+      const products = getOmieProductsFromResponse(response.data);
+      const diagnostics = { mode: queryMode.mode, ...describeOmieResponse(response.data) };
+      summary.diagnostics.push(diagnostics);
+      selectedResponse ||= response;
+      selectedProducts ||= products;
+      if (products.length) {
+        selectedResponse = response;
+        selectedProducts = products;
+        summary.query_mode = queryMode.mode;
+        break;
+      }
+    }
 
-    const products = Array.isArray(response.data?.produto_servico_cadastro)
-      ? response.data.produto_servico_cadastro
-      : [];
-    const totalPages = asPositiveInt(response.data?.total_de_paginas, page);
+    const products = selectedProducts;
+    const totalPages = asPositiveInt(selectedResponse?.data?.total_de_paginas, page);
     summary.total_pages = totalPages;
+    summary.total_records = Number(selectedResponse?.data?.total_de_registros || selectedResponse?.data?.total_de_registros_encontrados || summary.total_records || 0);
     summary.pages += 1;
     summary.received += products.length;
 
@@ -204,6 +257,9 @@ export async function syncOmieProducts(client, { loaded, payload = {}, fetchImpl
 
   if (summary.total_pages && page < summary.total_pages) {
     summary.next_page = page + 1;
+  }
+  if (!summary.received) {
+    summary.warning = "OMIE respondeu a listagem de produtos, mas nao retornou produtos para importar.";
   }
 
   return summary;
