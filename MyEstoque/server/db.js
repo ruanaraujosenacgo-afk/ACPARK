@@ -4,9 +4,13 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 
-const { Pool } = pg;
+process.env.TZ ||= "America/Sao_Paulo";
+
+const { Pool, types } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
+
+types.setTypeParser(1114, (value) => value);
 
 function readStreamlitSecret() {
   const file = path.join(rootDir, ".streamlit", "secrets.toml");
@@ -31,12 +35,32 @@ if (!rawConnectionString) {
   throw new Error("Configure DATABASE_URL no .env ou mantenha .streamlit/secrets.toml com a conexao PostgreSQL.");
 }
 
-const connectionString = rawConnectionString.replace(/([?&])sslmode=[^&]+&?/, (match, prefix) => prefix === "?" ? "?" : "");
-const usesHostedPostgres = rawConnectionString.includes("supabase.com") || rawConnectionString.includes("pooler.supabase.com");
+const parsedConnection = new URL(rawConnectionString);
+const sslmode = parsedConnection.searchParams.get("sslmode");
+parsedConnection.searchParams.delete("sslmode");
+const connectionString = parsedConnection.toString();
+const hostname = parsedConnection.hostname.toLowerCase();
+const usesHostedPostgres = sslmode !== "disable" && !["localhost", "127.0.0.1", "::1"].includes(hostname);
+const configuredPoolMax = Number(process.env.PGPOOL_MAX || process.env.DB_POOL_MAX || 0);
+const poolMax = Number.isFinite(configuredPoolMax) && configuredPoolMax > 0
+  ? configuredPoolMax
+  : usesHostedPostgres
+    ? 1
+    : 10;
 
 export const pool = new Pool({
   connectionString,
-  ssl: usesHostedPostgres ? { rejectUnauthorized: false } : undefined
+  ssl: usesHostedPostgres ? { rejectUnauthorized: false } : undefined,
+  max: poolMax,
+  idleTimeoutMillis: 10_000,
+  connectionTimeoutMillis: 5_000,
+  allowExitOnIdle: true,
+  // Supabase transaction pooler does not work well with traditional prepared statements.
+  prepareThreshold: 0
+});
+
+pool.on("connect", (client) => {
+  client.query("SET TIME ZONE 'America/Sao_Paulo'").catch(() => {});
 });
 
 export async function query(text, params = []) {
@@ -91,6 +115,15 @@ export function asInt(value, fallback = 0) {
 }
 
 export function code(prefix) {
-  const stamp = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
+  const stamp = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(new Date()).replace(/\D/g, "");
   return `${prefix}-${stamp}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
 }

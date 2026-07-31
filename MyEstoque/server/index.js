@@ -1,4 +1,4 @@
-import "dotenv/config";
+﻿import "dotenv/config";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -6,6 +6,15 @@ import { fileURLToPath } from "node:url";
 import jwt from "jsonwebtoken";
 import { parse as parseCookie, serialize as serializeCookie } from "cookie";
 import { pool, query, tx, verifyPassword, hashPassword, asInt, code } from "./db.js";
+import { handleEstoqueRoutes } from "./modules/estoque/estoque.routes.js";
+import { syncPdvAllowedProducts } from "./modules/estoque/estoque.service.js";
+import { handlePedidosRoutes } from "./modules/pedidos/pedidos.routes.js";
+import { handleAvariasRoutes } from "./modules/avarias/avarias.routes.js";
+import { handleOmieRoutes } from "./modules/omie/omie.routes.js";
+import { handleIntegrationWebhookRoutes, handleIntegrationsRoutes } from "./modules/integrations/integrations.routes.js";
+import { handleOrderAlertRoutes } from "./modules/order-alerts/order-alerts.routes.js";
+import { runOmieSchedulerTick, startOmieScheduler } from "./services/integrations/omie/omie.scheduler.js";
+import { normalizeCategories, normalizeCategoryList, normalizeText, readBody, send } from "./utils/http.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -14,6 +23,7 @@ const port = Number(process.env.PORT || 5173);
 const jwtSecret = process.env.JWT_SECRET || "dev-only-change-me";
 const secureCookies = process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
 const sessionCookieOptions = { path: "/", httpOnly: true, sameSite: "lax", secure: secureCookies };
+const autoSyncSchema = !process.env.VERCEL || process.env.SCHEMA_SYNC === "true";
 
 const mime = {
   ".html": "text/html; charset=utf-8",
@@ -22,28 +32,6 @@ const mime = {
   ".json": "application/json; charset=utf-8"
 };
 
-function send(res, status, data, headers = {}) {
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", ...headers });
-  res.end(JSON.stringify(data));
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > 1_000_000) reject(new Error("Payload muito grande."));
-    });
-    req.on("end", () => {
-      if (!body) return resolve({});
-      try {
-        resolve(JSON.parse(body));
-      } catch {
-        reject(new Error("JSON invalido."));
-      }
-    });
-  });
-}
 
 function sessionFrom(req) {
   const cookies = parseCookie(req.headers.cookie || "");
@@ -62,42 +50,10 @@ function requireUser(req, res, role = null) {
     return null;
   }
   if (role && user.role !== role) {
-    send(res, 403, { error: "Acesso nao permitido para este perfil." });
+    send(res, 403, { error: "Acesso não permitido para este perfil." });
     return null;
   }
   return user;
-}
-
-function normalizeText(value, max = 120) {
-  return String(value || "").trim().slice(0, max);
-}
-
-function normalizeCategories(values) {
-  if (!Array.isArray(values)) return [];
-  return [...new Set(values.map((value) => normalizeText(value, 120).toUpperCase()).filter(Boolean))];
-}
-
-async function syncPdvAllowedProducts(client, pdvId) {
-  await client.query(
-    `INSERT INTO estoque_pdv (pdv_id, sku_produto, permitido)
-     SELECT $1, p.sku, TRUE
-     FROM produtos p
-     JOIN pdv_categorias pc ON pc.pdv_id = $1 AND pc.categoria = p.categoria
-     ON CONFLICT (pdv_id, sku_produto) DO UPDATE SET permitido = TRUE`,
-    [pdvId]
-  );
-  await client.query(
-    `UPDATE estoque_pdv e
-     SET permitido = FALSE
-     WHERE e.pdv_id = $1
-       AND NOT EXISTS (
-         SELECT 1
-         FROM produtos p
-         JOIN pdv_categorias pc ON pc.pdv_id = e.pdv_id AND pc.categoria = p.categoria
-         WHERE p.sku = e.sku_produto
-       )`,
-    [pdvId]
-  );
 }
 
 async function ensureSchema() {
@@ -105,33 +61,8 @@ async function ensureSchema() {
   await pool.query(schema);
 }
 
-async function processOrionAndAutoOrders() {
+async function processAutoOrders() {
   await tx(async (client) => {
-    const pending = await client.query(
-      `SELECT id, pdv_id, sku_produto, quantidade_vendida, COALESCE(tipo_operacao, 'VENDA') AS tipo_operacao
-       FROM vendas_orion
-       WHERE processado = FALSE
-       ORDER BY id`
-    );
-
-    for (const row of pending.rows) {
-      const qty = asInt(row.quantidade_vendida);
-      if (row.tipo_operacao === "DEVOLUCAO") {
-        await client.query(
-          `UPDATE estoque_pdv SET quantidade = quantidade + $1
-           WHERE pdv_id = $2 AND sku_produto = $3`,
-          [qty, row.pdv_id, row.sku_produto]
-        );
-      } else {
-        await client.query(
-          `UPDATE estoque_pdv SET quantidade = GREATEST(0, quantidade - $1)
-           WHERE pdv_id = $2 AND sku_produto = $3`,
-          [qty, row.pdv_id, row.sku_produto]
-        );
-      }
-      await client.query("UPDATE vendas_orion SET processado = TRUE WHERE id = $1", [row.id]);
-    }
-
     const lows = await client.query(
       `SELECT e.pdv_id, e.sku_produto, e.quantidade, e.estoque_minimo, e.estoque_maximo
        FROM estoque_pdv e
@@ -203,13 +134,24 @@ async function api(req, res) {
     return send(res, 200, { pdvs: await query("SELECT id, nome FROM pdvs ORDER BY nome") });
   }
 
+  if (url.pathname === "/api/cron/omie-sync") {
+    const cronSecret = process.env.CRON_SECRET;
+    if (cronSecret && req.headers.authorization !== `Bearer ${cronSecret}`) {
+      return send(res, 401, { error: "Cron nao autorizado." });
+    }
+    const result = await runOmieSchedulerTick();
+    return send(res, 200, { ok: true, result });
+  }
+
+  if (await handleIntegrationWebhookRoutes(req, res, { method, requireUser, url })) return;
+
   const user = requireUser(req, res);
   if (!user) return;
 
-  await processOrionAndAutoOrders();
+  await processAutoOrders();
 
   if (url.pathname === "/api/bootstrap") {
-    const [pdvs, products, categories] = await Promise.all([
+    const [pdvs, products, categories, configRows] = await Promise.all([
       query(`
         SELECT p.id, p.nome, p.codigo_orion, p.is_cozinha, p.categoria,
                COALESCE(ARRAY(
@@ -221,132 +163,136 @@ async function api(req, res) {
         FROM pdvs p
         ORDER BY p.nome
       `),
-      query("SELECT sku, nome, qtd_total, ativo, categoria, COALESCE(origem, 'manual') AS origem FROM produtos ORDER BY nome"),
-      query("SELECT nome FROM categorias ORDER BY nome")
+      query(`
+        SELECT p.sku, p.nome, p.qtd_total, p.ativo,
+               COALESCE(string_agg(pc.categoria, ', ' ORDER BY pc.categoria), '') AS categoria,
+               COALESCE(array_agg(pc.categoria ORDER BY pc.categoria) FILTER (WHERE pc.categoria IS NOT NULL), '{}') AS categorias,
+               COALESCE(p.origem, 'manual') AS origem
+        FROM produtos p
+        LEFT JOIN produto_categorias pc ON pc.sku_produto = p.sku
+        GROUP BY p.sku, p.nome, p.qtd_total, p.ativo, p.origem
+        ORDER BY p.nome`),
+      query("SELECT nome FROM categorias ORDER BY nome"),
+      user.role === "admin"
+        ? query(`
+            SELECT chave, valor
+            FROM configuracoes
+            WHERE chave IN (
+              'omie_app_key',
+              'omie_app_secret'
+            )`)
+        : []
     ]);
-    return send(res, 200, { pdvs, products, categories, user });
+    const config = {};
+    for (const row of configRows) {
+      config[row.chave] = row.valor;
+    }
+    return send(res, 200, { pdvs, products, categories, user, config });
   }
 
-  if (url.pathname === "/api/pdv/products") {
-    const pdvId = user.role === "pdv" ? user.pdvId : asInt(url.searchParams.get("pdvId"));
-    const rows = await query(
-      `SELECT p.sku, p.nome, p.categoria, e.quantidade, e.estoque_minimo, e.estoque_maximo
-       FROM estoque_pdv e
-       JOIN produtos p ON p.sku = e.sku_produto
-       JOIN pdv_categorias pc ON pc.pdv_id = e.pdv_id AND pc.categoria = p.categoria
-       WHERE e.pdv_id = $1 AND e.permitido = TRUE AND p.ativo = TRUE
-       ORDER BY p.nome`,
-      [pdvId]
-    );
-    return send(res, 200, { products: rows });
-  }
-
-  if (url.pathname === "/api/pdv/order" && method === "POST") {
-    if (user.role !== "pdv") return send(res, 403, { error: "Entre como PDV para solicitar produtos." });
-    const body = await readBody(req);
-    const solicitante = normalizeText(body.solicitante, 80).toUpperCase();
-    const observacao = normalizeText(body.observacao, 500);
-    const items = Array.isArray(body.items) ? body.items : [];
-    if (!solicitante || !items.length) return send(res, 400, { error: "Informe solicitante e ao menos um item." });
-
-    const orderCode = code("PED");
-    await tx(async (client) => {
-      for (const item of items) {
-        const sku = normalizeText(item.sku, 60);
-        const qty = asInt(item.quantidade);
-        if (!sku || qty <= 0) throw new Error("Item invalido.");
-
-        const allowed = await client.query(
-          `SELECT e.quantidade, e.estoque_maximo
-           FROM estoque_pdv e
-           JOIN produtos p ON p.sku = e.sku_produto
-           JOIN pdv_categorias pc ON pc.pdv_id = e.pdv_id AND pc.categoria = p.categoria
-           WHERE e.pdv_id = $1 AND e.sku_produto = $2 AND e.permitido = TRUE`,
-          [user.pdvId, sku]
-        );
-        if (!allowed.rows[0]) throw new Error("Produto nao liberado para este PDV.");
-        const max = asInt(allowed.rows[0].estoque_maximo);
-        const current = asInt(allowed.rows[0].quantidade);
-        if (max > 0 && current + qty > max) throw new Error(`Pedido acima do estoque maximo para ${sku}.`);
-
-        await client.query(
-          `INSERT INTO pedidos
-            (codigo_pedido, solicitante, sku_produto, pdv_id, quantidade_solicitada, observacao)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [orderCode, solicitante, sku, user.pdvId, qty, observacao]
-        );
-      }
-    });
-    return send(res, 201, { ok: true, codigo: orderCode });
-  }
-
-  if (url.pathname === "/api/pdv/orders") {
-    const pdvId = user.role === "pdv" ? user.pdvId : asInt(url.searchParams.get("pdvId"));
-    const from = url.searchParams.get("from");
-    const to = url.searchParams.get("to");
-    const rows = await query(
-      `SELECT p.codigo_pedido, p.data_hora, pr.nome AS produto, p.quantidade_solicitada,
-              p.quantidade_liberada, p.status, p.observacao, p.em_andamento_em, p.liberado_em
-       FROM pedidos p
-       JOIN produtos pr ON pr.sku = p.sku_produto
-       WHERE p.pdv_id = $1 AND ($2::date IS NULL OR p.data_hora::date >= $2::date)
-         AND ($3::date IS NULL OR p.data_hora::date <= $3::date)
-       ORDER BY p.data_hora ASC, p.id ASC`,
-      [pdvId, from || null, to || null]
-    );
-    return send(res, 200, { orders: rows });
-  }
+  if (await handleEstoqueRoutes(req, res, { method, requireUser, url, user })) return;
+  if (await handlePedidosRoutes(req, res, { method, requireUser, url, user })) return;
+  if (await handleAvariasRoutes(req, res, { method, requireUser, url, user })) return;
+  if (await handleOmieRoutes(req, res, { method, requireUser, url, user })) return;
+  if (await handleIntegrationsRoutes(req, res, { method, requireUser, url, user })) return;
+  if (await handleOrderAlertRoutes(req, res, { method, url, user })) return;
 
   if (url.pathname === "/api/admin/products") {
     if (!requireUser(req, res, "admin")) return;
     if (method === "GET") {
-      return send(res, 200, { products: await query("SELECT sku, nome, qtd_total, ativo, categoria, COALESCE(origem, 'manual') AS origem FROM produtos ORDER BY nome") });
+      return send(res, 200, { products: await query(`
+        SELECT p.sku, p.nome, p.qtd_total, p.ativo,
+               COALESCE(string_agg(pc.categoria, ', ' ORDER BY pc.categoria), '') AS categoria,
+               COALESCE(array_agg(pc.categoria ORDER BY pc.categoria) FILTER (WHERE pc.categoria IS NOT NULL), '{}') AS categorias,
+               COALESCE(p.origem, 'manual') AS origem
+        FROM produtos p
+        LEFT JOIN produto_categorias pc ON pc.sku_produto = p.sku
+        GROUP BY p.sku, p.nome, p.qtd_total, p.ativo, p.origem
+        ORDER BY p.nome`) });
     }
     const body = await readBody(req);
     if (method === "POST") {
-      const sku = normalizeText(body.sku, 60).toUpperCase();
+      const sku = normalizeText(body.sku, 60);
       const nome = normalizeText(body.nome, 160).toUpperCase();
       const qty = asInt(body.qtd_total);
-      if (!sku || !nome) return send(res, 400, { error: "SKU e nome sao obrigatorios." });
-      const inserted = await query(
-        `INSERT INTO produtos (sku, nome, qtd_total, estoque_central, ativo, categoria, origem)
-         VALUES ($1, $2, $3, $3, TRUE, NULL, 'manual')
-         ON CONFLICT (sku) DO UPDATE SET
-           nome = EXCLUDED.nome,
-           qtd_total = EXCLUDED.qtd_total,
-           estoque_central = EXCLUDED.estoque_central,
-           ativo = TRUE
-         WHERE COALESCE(produtos.origem, 'manual') = 'manual'
-         RETURNING sku`,
-        [sku, nome, qty]
-      );
+      const categorias = Array.isArray(body.categorias)
+        ? [...new Set(body.categorias.map((item) => normalizeText(item, 120).toUpperCase()).filter(Boolean))]
+        : [];
+      if (!sku || !nome) return send(res, 400, { error: "SKU e nome são obrigatórios." });
+      const inserted = await tx(async (client) => {
+        const result = await client.query(
+          `INSERT INTO produtos (sku, nome, qtd_total, estoque_central, ativo, categoria, origem)
+           VALUES ($1, $2, $3, $3, TRUE, NULL, 'manual')
+           ON CONFLICT (sku) DO UPDATE SET
+             nome = EXCLUDED.nome,
+             qtd_total = EXCLUDED.qtd_total,
+             estoque_central = EXCLUDED.estoque_central,
+             ativo = TRUE
+           WHERE COALESCE(produtos.origem, 'manual') = 'manual'
+           RETURNING sku`,
+          [sku, nome, qty]
+        );
+        if (!result.rows[0]) return [];
+        await client.query("DELETE FROM produto_categorias WHERE sku_produto = $1", [sku]);
+        for (const category of categorias) {
+          await client.query("INSERT INTO categorias (nome) VALUES ($1) ON CONFLICT (nome) DO NOTHING", [category]);
+          await client.query(
+            `INSERT INTO produto_categorias (sku_produto, categoria)
+             VALUES ($1, $2)
+             ON CONFLICT (sku_produto, categoria) DO NOTHING`,
+            [sku, category]
+          );
+        }
+        await client.query("UPDATE produtos SET categoria = $2 WHERE sku = $1", [sku, categorias[0] || null]);
+        return result.rows;
+      });
       if (!inserted[0]) return send(res, 400, { error: "Este SKU pertence a um produto integrado ao OMIE." });
       return send(res, 200, { ok: true });
     }
     if (method === "PATCH") {
-      const sku = normalizeText(body.sku, 60).toUpperCase();
-      const updated = await query("UPDATE produtos SET nome = $2, qtd_total = $3, estoque_central = $3, ativo = $4 WHERE sku = $1 AND COALESCE(origem, 'manual') = 'manual' RETURNING sku", [
-        sku,
-        normalizeText(body.nome, 160).toUpperCase(),
-        asInt(body.qtd_total),
-        Boolean(body.ativo)
-      ]);
-      if (!updated[0]) return send(res, 400, { error: "Produto integrado ao OMIE nao pode ser editado aqui." });
+      const sku = normalizeText(body.sku, 60);
+      const categorias = Array.isArray(body.categorias)
+        ? [...new Set(body.categorias.map((item) => normalizeText(item, 120).toUpperCase()).filter(Boolean))]
+        : [];
+      const updated = await tx(async (client) => {
+        const result = await client.query(
+          "UPDATE produtos SET nome = $2, qtd_total = $3, estoque_central = $3, ativo = $4, categoria = $5 WHERE sku = $1 AND COALESCE(origem, 'manual') = 'manual' RETURNING sku",
+          [sku, normalizeText(body.nome, 160).toUpperCase(), asInt(body.qtd_total), Boolean(body.ativo), categorias[0] || null]
+        );
+        if (!result.rows[0]) return [];
+        await client.query("DELETE FROM produto_categorias WHERE sku_produto = $1", [sku]);
+        for (const category of categorias) {
+          await client.query("INSERT INTO categorias (nome) VALUES ($1) ON CONFLICT (nome) DO NOTHING", [category]);
+          await client.query(
+            `INSERT INTO produto_categorias (sku_produto, categoria)
+             VALUES ($1, $2)
+             ON CONFLICT (sku_produto, categoria) DO NOTHING`,
+            [sku, category]
+          );
+        }
+        return result.rows;
+      });
+      if (!updated[0]) return send(res, 400, { error: "Produto integrado ao OMIE não pode ser editado aqui." });
       if (!body.ativo) await query("UPDATE estoque_pdv SET permitido = FALSE WHERE sku_produto = $1", [sku]);
+      if (body.ativo) {
+        const pdvs = await query("SELECT id FROM pdvs");
+        await tx(async (client) => {
+          for (const pdv of pdvs) await syncPdvAllowedProducts(client, pdv.id);
+        });
+      }
       return send(res, 200, { ok: true });
     }
     if (method === "DELETE") {
-      const sku = normalizeText(body.sku, 60).toUpperCase();
+      const sku = normalizeText(body.sku, 60);
       const deleted = await tx(async (client) => {
         const check = await client.query("SELECT sku FROM produtos WHERE sku = $1 AND COALESCE(origem, 'manual') = 'manual'", [sku]);
         if (!check.rows[0]) return [];
-        await client.query("DELETE FROM vendas_orion WHERE sku_produto = $1", [sku]);
         await client.query("DELETE FROM pedidos WHERE sku_produto = $1", [sku]);
         await client.query("DELETE FROM estoque_pdv WHERE sku_produto = $1", [sku]);
         const result = await client.query("DELETE FROM produtos WHERE sku = $1 RETURNING sku", [sku]);
         return result.rows;
       });
-      if (!deleted[0]) return send(res, 400, { error: "Produto integrado ao OMIE nao pode ser excluido aqui." });
+      if (!deleted[0]) return send(res, 400, { error: "Produto integrado ao OMIE não pode ser excluído aqui." });
       return send(res, 200, { ok: true });
     }
   }
@@ -355,33 +301,44 @@ async function api(req, res) {
     if (!requireUser(req, res, "admin")) return;
     const body = await readBody(req);
     const items = Array.isArray(body.items) ? body.items.slice(0, 2000) : [];
-    if (!items.length) return send(res, 400, { error: "Nenhum produto valido para importar." });
+    if (!items.length) return send(res, 400, { error: "Nenhum produto válido para importar." });
 
     let imported = 0;
     await tx(async (client) => {
       for (const item of items) {
-        const sku = normalizeText(item.sku, 60).toUpperCase();
+        const sku = normalizeText(item.sku, 60);
         const nome = normalizeText(item.nome, 160).toUpperCase();
-        const categoria = normalizeText(item.categoria, 120).toUpperCase() || null;
+        const categorias = normalizeCategoryList(item.categorias || item.categoria);
+        const categoria = categorias[0] || null;
+        const origem = String(item.origem || "").trim().toLowerCase() === "omie" ? "omie" : "manual";
         if (!sku || !nome) continue;
         await client.query(
           `INSERT INTO produtos (sku, nome, qtd_total, estoque_central, ativo, categoria, origem)
-           VALUES ($1, $2, $3, $3, $4, $5, 'omie')
+           VALUES ($1, $2, $3, $3, $4, $5, $6)
            ON CONFLICT (sku) DO UPDATE SET
              nome = EXCLUDED.nome,
              qtd_total = EXCLUDED.qtd_total,
              estoque_central = EXCLUDED.estoque_central,
              ativo = EXCLUDED.ativo,
              categoria = EXCLUDED.categoria,
-             origem = 'omie'`,
-          [sku, nome, asInt(item.qtd_total), item.ativo !== false, categoria]
+             origem = EXCLUDED.origem`,
+          [sku, nome, asInt(item.qtd_total), item.ativo !== false, categoria, origem]
         );
-        if (categoria) {
+        if (categorias.length) {
+          await client.query("DELETE FROM produto_categorias WHERE sku_produto = $1", [sku]);
+        }
+        for (const category of categorias) {
           await client.query(
             `INSERT INTO categorias (nome)
              VALUES ($1)
              ON CONFLICT (nome) DO NOTHING`,
-            [categoria]
+            [category]
+          );
+          await client.query(
+            `INSERT INTO produto_categorias (sku_produto, categoria)
+             VALUES ($1, $2)
+             ON CONFLICT (sku_produto, categoria) DO NOTHING`,
+            [sku, category]
           );
         }
         if (item.ativo === false) {
@@ -414,7 +371,7 @@ async function api(req, res) {
       const senha = normalizeText(body.senha, 120);
       const categoria = normalizeText(body.categoria, 120).toUpperCase() || null;
       const categorias = normalizeCategories(body.categorias);
-      if (!nome || !senha) return send(res, 400, { error: "Nome e senha sao obrigatorios." });
+      if (!nome || !senha) return send(res, 400, { error: "Nome e senha são obrigatórios." });
       const pdv = await query(
         `INSERT INTO pdvs (nome, senha, codigo_orion, is_cozinha, categoria)
          VALUES ($1, $2, $3, $4, $5)
@@ -448,7 +405,7 @@ async function api(req, res) {
       const pdvId = asInt(body.id);
       const categorias = normalizeCategories(body.categorias);
       const nome = normalizeText(body.nome, 120).toUpperCase();
-      if (!pdvId || !nome) return send(res, 400, { error: "PDV invalido." });
+      if (!pdvId || !nome) return send(res, 400, { error: "PDV inválido." });
       await query("UPDATE pdvs SET nome = $2, codigo_orion = $3, is_cozinha = $4, categoria = $5 WHERE id = $1", [
         pdvId,
         nome,
@@ -491,16 +448,21 @@ async function api(req, res) {
     if (method === "GET") {
       const rows = await query(
         `SELECT trim(upper(c.nome)) AS nome,
-                (SELECT COUNT(*)::int FROM produtos p WHERE trim(upper(COALESCE(p.categoria, ''))) = trim(upper(c.nome))) AS produtos,
+                (SELECT COUNT(*)::int FROM produto_categorias pcg WHERE trim(upper(pcg.categoria)) = trim(upper(c.nome))) AS produtos,
                 (SELECT COUNT(*)::int FROM pdv_categorias pc WHERE trim(upper(pc.categoria)) = trim(upper(c.nome))) AS pdvs
          FROM categorias c
          ORDER BY trim(upper(c.nome))`
       );
       const products = await query(
-        `SELECT sku, nome, trim(upper(COALESCE(categoria, ''))) AS categoria, COALESCE(origem, 'manual') AS origem
-         FROM produtos
-         WHERE ativo = TRUE
-         ORDER BY nome`
+        `SELECT p.sku, p.nome,
+                COALESCE(string_agg(pc.categoria, ', ' ORDER BY pc.categoria), '') AS categoria,
+                COALESCE(array_agg(pc.categoria ORDER BY pc.categoria) FILTER (WHERE pc.categoria IS NOT NULL), '{}') AS categorias,
+                COALESCE(p.origem, 'manual') AS origem
+         FROM produtos p
+         LEFT JOIN produto_categorias pc ON pc.sku_produto = p.sku
+         WHERE p.ativo = TRUE
+         GROUP BY p.sku, p.nome, p.origem
+         ORDER BY p.nome`
       );
       return send(res, 200, { categories: rows, products });
     }
@@ -519,10 +481,11 @@ async function api(req, res) {
     if (method === "PATCH") {
       const atual = normalizeText(body.atual, 120).toUpperCase();
       const nome = normalizeText(body.nome, 120).toUpperCase();
-      if (!atual || !nome) return send(res, 400, { error: "Categoria atual e novo nome sao obrigatorios." });
+      if (!atual || !nome) return send(res, 400, { error: "Categoria atual e novo nome são obrigatórios." });
       await tx(async (client) => {
         await client.query("UPDATE categorias SET nome = $2 WHERE nome = $1", [atual, nome]);
         await client.query("UPDATE produtos SET categoria = $2 WHERE categoria = $1", [atual, nome]);
+        await client.query("UPDATE produto_categorias SET categoria = $2 WHERE categoria = $1", [atual, nome]);
         await client.query("UPDATE pdv_categorias SET categoria = $2 WHERE categoria = $1", [atual, nome]);
         await client.query("UPDATE pdvs SET categoria = $2 WHERE categoria = $1", [atual, nome]);
       });
@@ -534,6 +497,7 @@ async function api(req, res) {
       await tx(async (client) => {
         await client.query("DELETE FROM categorias WHERE nome = $1", [nome]);
         await client.query("UPDATE produtos SET categoria = NULL WHERE categoria = $1", [nome]);
+        await client.query("DELETE FROM produto_categorias WHERE categoria = $1", [nome]);
         await client.query("DELETE FROM pdv_categorias WHERE categoria = $1", [nome]);
         await client.query("UPDATE pdvs SET categoria = NULL WHERE categoria = $1", [nome]);
       });
@@ -544,201 +508,63 @@ async function api(req, res) {
   if (url.pathname === "/api/admin/category-products" && method === "POST") {
     if (!requireUser(req, res, "admin")) return;
     const body = await readBody(req);
-    const sku = normalizeText(body.sku, 60).toUpperCase();
+    const skus = Array.isArray(body.skus)
+      ? [...new Set(body.skus.map((item) => normalizeText(item, 60)).filter(Boolean))]
+      : [normalizeText(body.sku, 60)].filter(Boolean);
     const categoria = normalizeText(body.categoria, 120).toUpperCase() || null;
-    if (!sku) return send(res, 400, { error: "Produto invalido." });
-    if (categoria) {
-      await query(
-        `INSERT INTO categorias (nome)
-         VALUES ($1)
-         ON CONFLICT (nome) DO NOTHING`,
-        [categoria]
-      );
-    }
+    const action = String(body.action || "").toLowerCase();
+    if (!skus.length) return send(res, 400, { error: "Produto inválido." });
     await tx(async (client) => {
-      await client.query("UPDATE produtos SET categoria = $2 WHERE sku = $1", [sku, categoria]);
+      if (action === "remove" || action === "delete") {
+        for (const sku of skus) {
+          if (categoria) {
+            await client.query("DELETE FROM produto_categorias WHERE sku_produto = $1 AND categoria = $2", [sku, categoria]);
+            await client.query(
+              `UPDATE produtos p
+               SET categoria = (
+                 SELECT pc.categoria
+                 FROM produto_categorias pc
+                 WHERE pc.sku_produto = p.sku
+                 ORDER BY pc.categoria
+                 LIMIT 1
+               )
+               WHERE p.sku = $1 AND p.categoria = $2`,
+              [sku, categoria]
+            );
+          } else {
+            await client.query("DELETE FROM produto_categorias WHERE sku_produto = $1", [sku]);
+            await client.query("UPDATE produtos SET categoria = NULL WHERE sku = $1", [sku]);
+          }
+        }
+      } else {
+        if (!categoria) return;
+        await client.query(
+          `INSERT INTO categorias (nome)
+           VALUES ($1)
+           ON CONFLICT (nome) DO NOTHING`,
+          [categoria]
+        );
+        for (const sku of skus) {
+          await client.query(
+            `INSERT INTO produto_categorias (sku_produto, categoria)
+             VALUES ($1, $2)
+             ON CONFLICT (sku_produto, categoria) DO NOTHING`,
+            [sku, categoria]
+          );
+          await client.query(
+            `UPDATE produtos
+             SET categoria = COALESCE(categoria, $2)
+             WHERE sku = $1`,
+            [sku, categoria]
+          );
+        }
+      }
       const pdvs = await client.query("SELECT id FROM pdvs");
       for (const pdv of pdvs.rows) {
         await syncPdvAllowedProducts(client, pdv.id);
       }
     });
-    return send(res, 200, { ok: true });
-  }
-
-  if (url.pathname === "/api/admin/stock") {
-    if (!requireUser(req, res, "admin")) return;
-    const pdvId = asInt(url.searchParams.get("pdvId"));
-    if (method === "GET") {
-      const pdvRows = await query("SELECT id, nome, categoria, is_cozinha FROM pdvs WHERE id = $1", [pdvId]);
-      const pdv = pdvRows[0] || null;
-      const categoryRows = await query("SELECT categoria FROM pdv_categorias WHERE pdv_id = $1 ORDER BY categoria", [pdvId]);
-      const categorias = categoryRows.map((row) => row.categoria);
-      const rows = await query(
-        `SELECT p.sku, p.nome, p.categoria, TRUE AS permitido, COALESCE(e.quantidade, 0) quantidade,
-                COALESCE(e.estoque_minimo, 0) estoque_minimo, COALESCE(e.estoque_maximo, 0) estoque_maximo
-         FROM produtos p
-         LEFT JOIN estoque_pdv e ON e.sku_produto = p.sku AND e.pdv_id = $1
-         WHERE (
-           COALESCE(array_length($2::text[], 1), 0) > 0
-           AND p.categoria = ANY($2::text[])
-         )
-         ORDER BY p.nome`,
-        [pdvId, categorias]
-      );
-      return send(res, 200, { stock: rows, pdv: { ...pdv, categorias } });
-    }
-    if (method === "POST") {
-      const body = await readBody(req);
-      const items = Array.isArray(body.items) ? body.items : [];
-      const categoryRows = await query("SELECT categoria FROM pdv_categorias WHERE pdv_id = $1 ORDER BY categoria", [asInt(body.pdvId)]);
-      const categorias = categoryRows.map((row) => row.categoria);
-      await tx(async (client) => {
-        for (const item of items) {
-          const product = await client.query("SELECT categoria FROM produtos WHERE sku = $1", [item.sku]);
-          const permitido = categorias.includes(product.rows[0]?.categoria);
-          await client.query(
-            `INSERT INTO estoque_pdv (pdv_id, sku_produto, quantidade, estoque_minimo, estoque_maximo, permitido)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (pdv_id, sku_produto) DO UPDATE SET
-               quantidade = EXCLUDED.quantidade,
-               estoque_minimo = EXCLUDED.estoque_minimo,
-               estoque_maximo = EXCLUDED.estoque_maximo,
-               permitido = EXCLUDED.permitido`,
-            [asInt(body.pdvId), item.sku, asInt(item.quantidade), asInt(item.estoque_minimo), asInt(item.estoque_maximo), permitido]
-          );
-        }
-      });
-      return send(res, 200, { ok: true });
-    }
-  }
-
-  if (url.pathname === "/api/admin/orders") {
-    if (!requireUser(req, res, "admin")) return;
-    const from = url.searchParams.get("from");
-    const to = url.searchParams.get("to");
-    const rows = await query(
-      `SELECT p.id, p.codigo_pedido, p.pdv_id, pd.nome AS pdv, p.solicitante, p.sku_produto, pr.nome AS produto,
-              p.quantidade_solicitada, p.quantidade_liberada, p.status, p.observacao,
-              pr.qtd_total AS saldo, e.estoque_minimo, e.estoque_maximo, p.criado_em, p.em_andamento_em, p.liberado_em
-       FROM pedidos p
-       JOIN pdvs pd ON pd.id = p.pdv_id
-       JOIN produtos pr ON pr.sku = p.sku_produto
-       LEFT JOIN estoque_pdv e ON e.pdv_id = p.pdv_id AND e.sku_produto = p.sku_produto
-       WHERE ($1::date IS NULL OR p.criado_em::date >= $1::date)
-         AND ($2::date IS NULL OR p.criado_em::date <= $2::date)
-       ORDER BY p.criado_em ASC, p.id ASC`,
-      [from || null, to || null]
-    );
-    return send(res, 200, { orders: rows });
-  }
-
-  if (url.pathname === "/api/admin/order-flow" && method === "POST") {
-    if (!requireUser(req, res, "admin")) return;
-    const body = await readBody(req);
-    const nextStatus = ["Pendente", "Em Andamento", "Liberado"].includes(body.status) ? body.status : null;
-    const items = Array.isArray(body.items) ? body.items : [];
-    if (!nextStatus || !items.length) return send(res, 400, { error: "Status ou itens invalidos." });
-
-    await tx(async (client) => {
-      for (const item of items) {
-        const old = await client.query("SELECT status, quantidade_liberada, pdv_id, sku_produto FROM pedidos WHERE id = $1", [asInt(item.id)]);
-        if (!old.rows[0]) continue;
-        const current = old.rows[0];
-        if (item.remover) {
-          if (current.status === "Liberado") {
-            const oldQty = asInt(current.quantidade_liberada);
-            await client.query("UPDATE produtos SET qtd_total = qtd_total + $1 WHERE sku = $2", [oldQty, current.sku_produto]);
-            await client.query(
-              "UPDATE estoque_pdv SET quantidade = GREATEST(0, quantidade - $1) WHERE pdv_id = $2 AND sku_produto = $3",
-              [oldQty, current.pdv_id, current.sku_produto]
-            );
-          }
-          await client.query("DELETE FROM pedidos WHERE id = $1", [asInt(item.id)]);
-          continue;
-        }
-        const qty = asInt(item.quantidade_liberada);
-
-        const timeField = nextStatus === "Em Andamento" ? ", em_andamento_em = CURRENT_TIMESTAMP" : nextStatus === "Liberado" ? ", liberado_em = CURRENT_TIMESTAMP" : "";
-        await client.query(
-          `UPDATE pedidos SET status = $1, quantidade_liberada = $2 ${timeField} WHERE id = $3`,
-          [nextStatus, qty, asInt(item.id)]
-        );
-
-        if (nextStatus === "Liberado") {
-          const oldReleasedQty = current.status === "Liberado" ? asInt(current.quantidade_liberada) : 0;
-          const delta = qty - oldReleasedQty;
-          if (delta !== 0) {
-            await client.query("UPDATE produtos SET qtd_total = qtd_total - $1 WHERE sku = $2", [delta, current.sku_produto]);
-            if (current.status === "Liberado") {
-              await client.query(
-                "UPDATE estoque_pdv SET quantidade = GREATEST(0, quantidade + $1) WHERE pdv_id = $2 AND sku_produto = $3",
-                [delta, current.pdv_id, current.sku_produto]
-              );
-            } else if (qty > 0) {
-              await client.query(
-                `INSERT INTO estoque_pdv (pdv_id, sku_produto, quantidade)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT (pdv_id, sku_produto) DO UPDATE SET quantidade = estoque_pdv.quantidade + $3`,
-                [current.pdv_id, current.sku_produto, qty]
-              );
-            }
-          }
-        }
-
-        if (nextStatus !== "Liberado" && current.status === "Liberado") {
-          const oldQty = asInt(current.quantidade_liberada);
-          await client.query("UPDATE produtos SET qtd_total = qtd_total + $1 WHERE sku = $2", [oldQty, current.sku_produto]);
-          await client.query(
-            "UPDATE estoque_pdv SET quantidade = GREATEST(0, quantidade - $1) WHERE pdv_id = $2 AND sku_produto = $3",
-            [oldQty, current.pdv_id, current.sku_produto]
-          );
-        }
-      }
-    });
-    return send(res, 200, { ok: true });
-  }
-
-  if (url.pathname === "/api/admin/orion") {
-    if (!requireUser(req, res, "admin")) return;
-    if (method === "POST") {
-      const body = await readBody(req);
-      const type = body.tipo_operacao === "DEVOLUCAO" ? "DEVOLUCAO" : "VENDA";
-      await query(
-        `INSERT INTO vendas_orion (pdv_id, sku_produto, quantidade_vendida, tipo_operacao, processado)
-         VALUES ($1, $2, $3, $4, FALSE)`,
-        [asInt(body.pdvId), normalizeText(body.sku, 60), asInt(body.quantidade, 1), type]
-      );
-      await processOrionAndAutoOrders();
-      return send(res, 200, { ok: true });
-    }
-    const rows = await query(
-      `SELECT v.id, pd.nome AS pdv, pr.nome AS produto, v.quantidade_vendida, v.tipo_operacao, v.data_venda, v.processado
-       FROM vendas_orion v
-       JOIN pdvs pd ON pd.id = v.pdv_id
-       JOIN produtos pr ON pr.sku = v.sku_produto
-       ORDER BY v.data_venda DESC
-       LIMIT 200`
-    );
-    return send(res, 200, { events: rows });
-  }
-
-  if (url.pathname === "/api/admin/history") {
-    if (!requireUser(req, res, "admin")) return;
-    const pdvId = asInt(url.searchParams.get("pdvId"));
-    const autoOnly = url.searchParams.get("auto") === "1";
-    const rows = await query(
-      `SELECT p.data_hora, p.codigo_pedido, pd.nome AS pdv, pr.nome AS produto,
-              p.quantidade_solicitada, p.quantidade_liberada, p.status, p.solicitante
-       FROM pedidos p
-       JOIN pdvs pd ON pd.id = p.pdv_id
-       JOIN produtos pr ON pr.sku = p.sku_produto
-       WHERE ($1::int = 0 OR p.pdv_id = $1)
-         AND ($2::boolean = FALSE OR p.codigo_pedido LIKE 'AUTO-%')
-       ORDER BY p.data_hora DESC
-       LIMIT 500`,
-      [pdvId, autoOnly]
-    );
-    return send(res, 200, { history: rows });
+    return send(res, 200, { ok: true, total: skus.length });
   }
 
   if (url.pathname === "/api/admin/dashboard") {
@@ -748,19 +574,48 @@ async function api(req, res) {
     const sku = normalizeText(url.searchParams.get("sku"), 60);
     const productSearch = normalizeText(url.searchParams.get("q"), 120);
     const productSearchLike = productSearch ? `%${productSearch}%` : null;
-    const rows = await query(
-      `SELECT pd.nome AS pdv, pr.sku, pr.nome AS produto, SUM(p.quantidade_solicitada)::int AS total
-       FROM pedidos p
-       JOIN pdvs pd ON pd.id = p.pdv_id
-       JOIN produtos pr ON pr.sku = p.sku_produto
-       WHERE ($1::date IS NULL OR p.data_hora::date >= $1::date)
-         AND ($2::date IS NULL OR p.data_hora::date <= $2::date)
-         AND ($3::text IS NULL OR pr.nome ILIKE $3 OR pr.sku ILIKE $3)
-       GROUP BY pd.nome, pr.sku, pr.nome
-       ORDER BY total DESC
-       LIMIT 20`,
-      [from || null, to || null, productSearchLike]
-    );
+    const rankingType = url.searchParams.get("ranking") === "pdv" ? "pdv" : "produto";
+    const rows = rankingType === "pdv"
+      ? await query(
+        `SELECT pd.nome AS pdv, NULL::text AS sku, pd.nome AS produto,
+                COUNT(DISTINCT COALESCE(
+                  NULLIF(p.codigo_pedido, ''),
+                  concat(p.pdv_id, '|', p.solicitante, '|', p.data_hora, '|', COALESCE(p.observacao, ''))
+                ))::int AS total
+         FROM pedidos p
+         JOIN pdvs pd ON pd.id = p.pdv_id
+         JOIN produtos pr ON pr.sku = p.sku_produto
+         WHERE (CASE
+                  WHEN p.status = 'Liberado' THEN 'Finalizado'
+                  WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
+                  ELSE p.status
+                END) = 'Finalizado'
+           AND ($1::date IS NULL OR COALESCE(p.retirada_em, p.liberado_em, p.data_hora)::date >= $1::date)
+           AND ($2::date IS NULL OR COALESCE(p.retirada_em, p.liberado_em, p.data_hora)::date <= $2::date)
+           AND ($3::text IS NULL OR pr.nome ILIKE $3 OR pr.sku ILIKE $3)
+         GROUP BY pd.nome
+         ORDER BY total DESC
+         LIMIT 20`,
+        [from || null, to || null, productSearchLike]
+      )
+      : await query(
+        `SELECT NULL::text AS pdv, pr.sku, pr.nome AS produto,
+                SUM(COALESCE(NULLIF(p.quantidade_liberada, 0), p.quantidade_solicitada))::int AS total
+         FROM pedidos p
+         JOIN produtos pr ON pr.sku = p.sku_produto
+         WHERE (CASE
+                  WHEN p.status = 'Liberado' THEN 'Finalizado'
+                  WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
+                  ELSE p.status
+                END) = 'Finalizado'
+           AND ($1::date IS NULL OR COALESCE(p.retirada_em, p.liberado_em, p.data_hora)::date >= $1::date)
+           AND ($2::date IS NULL OR COALESCE(p.retirada_em, p.liberado_em, p.data_hora)::date <= $2::date)
+           AND ($3::text IS NULL OR pr.nome ILIKE $3 OR pr.sku ILIKE $3)
+         GROUP BY pr.sku, pr.nome
+         ORDER BY total DESC
+         LIMIT 20`,
+        [from || null, to || null, productSearchLike]
+      );
 
     let selectedSku = sku || rows[0]?.sku || "";
     let selectedProduct = [];
@@ -777,7 +632,7 @@ async function api(req, res) {
     }
     const productTrend = selectedSku ? await query(
       `SELECT to_char(months.month_start, 'YYYY-MM') AS mes,
-              COALESCE(SUM(p.quantidade_solicitada), 0)::int AS total
+              COALESCE(SUM(COALESCE(NULLIF(p.quantidade_liberada, 0), p.quantidade_solicitada)), 0)::int AS total
        FROM generate_series(
          date_trunc('month', CURRENT_DATE) - INTERVAL '5 months',
          date_trunc('month', CURRENT_DATE),
@@ -785,7 +640,12 @@ async function api(req, res) {
        ) AS months(month_start)
        LEFT JOIN pedidos p
          ON p.sku_produto = $1
-        AND date_trunc('month', p.data_hora) = months.month_start
+        AND (CASE
+               WHEN p.status = 'Liberado' THEN 'Finalizado'
+               WHEN p.status IN ('Liberado Parcial', 'Liberação Parcial') AND COALESCE(p.quantidade_liberada, 0) > 0 AND p.retirada_assinatura IS NOT NULL THEN 'Finalizado'
+               ELSE p.status
+             END) = 'Finalizado'
+        AND date_trunc('month', COALESCE(p.retirada_em, p.liberado_em, p.data_hora)) = months.month_start
        GROUP BY months.month_start
        ORDER BY months.month_start`,
       [selectedSku]
@@ -794,7 +654,13 @@ async function api(req, res) {
     if (selectedSku && !selectedProduct[0]) {
       selectedProduct = await query("SELECT sku, nome FROM produtos WHERE sku = $1", [selectedSku]);
     }
-    return send(res, 200, { ranking: rows, selectedProduct: selectedProduct[0] || null, productTrend });
+    const stats = (await query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE ativo = TRUE)::int AS ativos,
+              COUNT(*) FILTER (WHERE ativo = FALSE)::int AS inativos
+       FROM produtos`
+    ))[0] || { total: 0, ativos: 0, inativos: 0 };
+    return send(res, 200, { ranking: rows, rankingType, stats, selectedProduct: selectedProduct[0] || null, productTrend });
   }
 
   if (url.pathname === "/api/admin/config" && method === "POST") {
@@ -806,9 +672,11 @@ async function api(req, res) {
       const confirmPassword = normalizeText(body.confirmAdminPassword, 120);
       if (!currentPassword) return send(res, 400, { error: "Informe a senha atual do almoxarifado." });
       if (nextPassword.length < 4) return send(res, 400, { error: "A nova senha deve ter pelo menos 4 caracteres." });
-      if (confirmPassword && nextPassword !== confirmPassword) return send(res, 400, { error: "A confirmacao da senha nao confere." });
+      if (!confirmPassword) return send(res, 400, { error: "Confirme a nova senha do almoxarifado." });
+      if (nextPassword !== confirmPassword) return send(res, 400, { error: "A confirmação da senha não confere." });
       const rows = await query("SELECT valor FROM configuracoes WHERE chave = 'senha_almoxarifado'");
       if (!rows[0] || !verifyPassword(currentPassword, rows[0].valor)) return send(res, 401, { error: "Senha atual incorreta." });
+      if (verifyPassword(nextPassword, rows[0].valor)) return send(res, 400, { error: "A nova senha deve ser diferente da senha atual." });
       await query(
         `INSERT INTO configuracoes (chave, valor) VALUES ('senha_almoxarifado', $1)
          ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor`,
@@ -827,7 +695,7 @@ async function api(req, res) {
     return send(res, 200, { ok: true });
   }
 
-  return send(res, 404, { error: "Rota nao encontrada." });
+  return send(res, 404, { error: "Rota não encontrada." });
 }
 
 function serveStatic(req, res) {
@@ -863,11 +731,28 @@ function ensureSchemaOnce() {
 }
 
 export async function handler(req, res) {
-  await ensureSchemaOnce();
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname === "/api/health") {
+    try {
+      const result = await query("SELECT 1 AS ok");
+      return send(res, 200, { ok: true, db: result[0]?.ok === 1 });
+    } catch (error) {
+      return send(res, 500, { ok: false, error: error.message || "Falha na conexao com o banco." });
+    }
+  }
+
+  if (autoSyncSchema) {
+    await ensureSchemaOnce();
+  }
+
   if (req.url?.startsWith("/api/")) {
     api(req, res).catch((error) => {
       console.error(error);
-      send(res, 500, { error: error.message || "Erro interno." });
+      send(res, error.statusCode || 500, {
+        error: error.code || error.message || "Erro interno.",
+        message: error.message || "Erro interno.",
+        existingRequest: error.existingRequest || null
+      });
     });
   } else {
     serveStatic(req, res);
@@ -884,5 +769,7 @@ if (!process.env.VERCEL) {
     });
   }).listen(port, () => {
     console.log(`MyEstoque web rodando em http://localhost:${port}`);
+    startOmieScheduler();
   });
 }
+
